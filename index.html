@@ -1,0 +1,970 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Spectrum Shooter</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #0a0a1a;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: 'Courier New', monospace;
+            color: #fff;
+        }
+        #gameContainer {
+            text-align: center;
+        }
+        #canvas {
+            border: 2px solid #00ff88;
+            background: #0d0d1f;
+            display: block;
+            margin: 0 auto;
+        }
+        #info {
+            margin-top: 20px;
+            font-size: 14px;
+            color: #00ff88;
+        }
+        #controls {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #88ccff;
+        }
+        #powerup {
+            margin-top: 5px;
+            font-size: 13px;
+            color: #ffaa00;
+            min-height: 20px;
+        }
+    </style>
+</head>
+<body>
+<div id="gameContainer">
+    <canvas id="canvas" width="800" height="600"></canvas>
+    <div id="info">
+        Health: <span id="playerHealth">100</span> | Enemies: <span id="enemyCount">1</span> | Score: <span id="score">0</span>
+    </div>
+    <div id="powerup"></div>
+    <div id="controls">
+        WASD/Arrows: Move | SPACE: Shoot | Collect pellets for power-ups! | DANGER ZONE at bottom!
+    </div>
+</div>
+
+<script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+
+    // Audio Context Setup
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.8;
+    analyser.connect(audioCtx.destination);
+
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+
+    // D Dorian Scale
+    const dorianScale = {
+        D3: 146.83, E3: 164.81, F3: 174.61, G3: 196.00, A3: 220.00, B3: 246.94, C4: 261.63,
+        D4: 293.66, E4: 329.63, F4: 349.23, G4: 392.00, A4: 440.00, B4: 493.88, C5: 523.25,
+        D5: 587.33, E5: 659.25, F5: 698.46, G5: 783.99, A5: 880.00, B5: 987.77, C6: 1046.50
+    };
+
+    const DANGER_ZONE_HEIGHT = 120;
+    let dangerZoneDamageTimer = 0;
+
+    // Game State
+    const player = {
+        x: 100,
+        y: canvas.height / 2,
+        width: 30,
+        height: 30,
+        speed: 5,
+        health: 100,
+        color: '#00ff88',
+        score: 0,
+        powerups: [], // Array to hold multiple active powerups
+        powerupTimer: 0
+    };
+
+    const enemies = [];
+    let maxEnemies = 1;
+    let enemiesDestroyed = 0;
+
+    const bullets = [];
+    const pellets = [];
+    const keys = {};
+    let pelletSpawnTimer = 0;
+    const PELLET_SPAWN_INTERVAL = 45; // Even faster spawning
+    const MAX_PELLETS = 16; // Double from 8
+
+    // Audio effects
+    let reverbNode = null;
+    let delayNode = null;
+    let delayGain = null;
+    let delayFeedback = null;
+
+    async function createReverb() {
+        reverbNode = audioCtx.createConvolver();
+
+        const length = audioCtx.sampleRate * 2;
+        const impulse = audioCtx.createBuffer(2, length, audioCtx.sampleRate);
+        const left = impulse.getChannelData(0);
+        const right = impulse.getChannelData(1);
+
+        for (let i = 0; i < length; i++) {
+            const decay = Math.pow(1 - i / length, 3);
+            left[i] = (Math.random() * 2 - 1) * decay;
+            right[i] = (Math.random() * 2 - 1) * decay;
+        }
+
+        reverbNode.buffer = impulse;
+
+        delayNode = audioCtx.createDelay(1.0);
+        delayNode.delayTime.value = 0.3;
+
+        delayGain = audioCtx.createGain();
+        delayGain.gain.value = 0.3;
+
+        delayFeedback = audioCtx.createGain();
+        delayFeedback.gain.value = 0.4;
+
+        delayNode.connect(delayFeedback);
+        delayFeedback.connect(delayNode);
+        delayNode.connect(delayGain);
+
+        reverbNode.connect(analyser);
+        delayGain.connect(analyser);
+    }
+
+    // Ambient sound
+    let ambientOsc1 = null;
+    let ambientOsc2 = null;
+    let ambientGain = null;
+
+    function startAmbientSound() {
+        if (ambientOsc1) return;
+
+        ambientOsc1 = audioCtx.createOscillator();
+        ambientOsc2 = audioCtx.createOscillator();
+        ambientGain = audioCtx.createGain();
+
+        ambientOsc1.type = 'sine';
+        ambientOsc2.type = 'sine';
+        ambientOsc1.frequency.value = dorianScale.D3;
+        ambientOsc2.frequency.value = dorianScale.A3;
+        ambientGain.gain.value = 0.04;
+
+        ambientOsc1.connect(ambientGain);
+        ambientOsc2.connect(ambientGain);
+        ambientGain.connect(reverbNode);
+        ambientGain.connect(analyser);
+
+        ambientOsc1.start();
+        ambientOsc2.start();
+    }
+
+    // Sound functions
+    function createShootSound(note) {
+        // Main oscillator with smoother envelope
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+
+        // Add subtle filter for warmth
+        const filter = audioCtx.createBiquadFilter();
+        filter.type = 'lowpass';
+        filter.frequency.setValueAtTime(note * 3, audioCtx.currentTime);
+        filter.Q.value = 1;
+
+        osc.connect(filter);
+        filter.connect(gain);
+        gain.connect(reverbNode);
+        gain.connect(analyser);
+
+        osc.type = 'triangle'; // Softer than square
+        osc.frequency.setValueAtTime(note, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(note * 0.6, audioCtx.currentTime + 0.12);
+
+        // Smoother envelope
+        gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+        gain.gain.linearRampToValueAtTime(0.2, audioCtx.currentTime + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.12);
+
+        // Add subtle harmonics
+        const harmonic = audioCtx.createOscillator();
+        const harmonicGain = audioCtx.createGain();
+
+        harmonic.type = 'sine';
+        harmonic.frequency.value = note * 2; // Octave up
+        harmonicGain.gain.setValueAtTime(0.05, audioCtx.currentTime);
+        harmonicGain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.08);
+
+        harmonic.connect(harmonicGain);
+        harmonicGain.connect(reverbNode);
+        harmonicGain.connect(analyser);
+
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.12);
+        harmonic.start(audioCtx.currentTime);
+        harmonic.stop(audioCtx.currentTime + 0.08);
+    }
+
+    function createHitSound() {
+        // Lower pitched, thicker impact sound
+        const osc1 = audioCtx.createOscillator();
+        const osc2 = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+
+        // Filter for punch
+        const filter = audioCtx.createBiquadFilter();
+        filter.type = 'lowpass';
+        filter.frequency.setValueAtTime(400, audioCtx.currentTime);
+        filter.frequency.exponentialRampToValueAtTime(80, audioCtx.currentTime + 0.2);
+        filter.Q.value = 2;
+
+        osc1.connect(filter);
+        osc2.connect(filter);
+        filter.connect(gain);
+        gain.connect(delayNode);
+        gain.connect(analyser);
+
+        // Two detuned sawtooth waves for thickness
+        osc1.type = 'sawtooth';
+        osc2.type = 'sawtooth';
+        osc1.frequency.setValueAtTime(dorianScale.C4, audioCtx.currentTime);
+        osc1.frequency.exponentialRampToValueAtTime(dorianScale.F3, audioCtx.currentTime + 0.2);
+        osc2.frequency.setValueAtTime(dorianScale.C4 * 1.01, audioCtx.currentTime); // Slight detune
+        osc2.frequency.exponentialRampToValueAtTime(dorianScale.F3 * 1.01, audioCtx.currentTime + 0.2);
+
+        // Punchy envelope
+        gain.gain.setValueAtTime(0.4, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.2);
+
+        // Add sub-bass punch
+        const sub = audioCtx.createOscillator();
+        const subGain = audioCtx.createGain();
+        sub.type = 'sine';
+        sub.frequency.value = dorianScale.D3 * 0.5; // Sub-bass
+        subGain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+        subGain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.15);
+
+        sub.connect(subGain);
+        subGain.connect(analyser);
+
+        osc1.start(audioCtx.currentTime);
+        osc1.stop(audioCtx.currentTime + 0.2);
+        osc2.start(audioCtx.currentTime);
+        osc2.stop(audioCtx.currentTime + 0.2);
+        sub.start(audioCtx.currentTime);
+        sub.stop(audioCtx.currentTime + 0.15);
+    }
+
+    function createCollectSound() {
+        const notes = [dorianScale.D5, dorianScale.E5, dorianScale.G5];
+
+        notes.forEach((freq, i) => {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+
+            osc.connect(gain);
+            gain.connect(reverbNode);
+            gain.connect(analyser);
+
+            osc.type = 'sine';
+            osc.frequency.value = freq;
+
+            const startTime = audioCtx.currentTime + i * 0.04;
+            gain.gain.setValueAtTime(0.2, startTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, startTime + 0.15);
+
+            osc.start(startTime);
+            osc.stop(startTime + 0.15);
+        });
+    }
+
+    function createPowerupSound(type) {
+        // Different chord voicings for different power-ups
+        const chords = {
+            'rapid_fire': [dorianScale.D4, dorianScale.A4, dorianScale.D5], // Power chord
+            'spread_shot': [dorianScale.E4, dorianScale.G4, dorianScale.B4], // Minor triad
+            'shield': [dorianScale.F4, dorianScale.A4, dorianScale.C5], // Subdominant
+            'spectrum_heal': [dorianScale.G4, dorianScale.B4, dorianScale.D5], // Major sound
+            'homing': [dorianScale.A4, dorianScale.C5, dorianScale.E5] // Mysterious
+        };
+
+        const chord = chords[type] || chords['rapid_fire'];
+
+        chord.forEach((freq, i) => {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+
+            osc.connect(gain);
+            gain.connect(reverbNode);
+            gain.connect(analyser);
+
+            osc.type = 'triangle';
+            osc.frequency.value = freq;
+
+            gain.gain.setValueAtTime(0, audioCtx.currentTime + i * 0.04);
+            gain.gain.linearRampToValueAtTime(0.18, audioCtx.currentTime + i * 0.04 + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + i * 0.04 + 0.4);
+
+            osc.start(audioCtx.currentTime + i * 0.04);
+            osc.stop(audioCtx.currentTime + i * 0.04 + 0.4);
+        });
+    }
+
+    function createComboSound(comboLevel) {
+        // Ascending notes for combo levels
+        const baseNote = dorianScale.D5;
+        const note = baseNote * Math.pow(2, comboLevel * 0.25); // Up in intervals
+
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+
+        osc.type = 'sine';
+        osc.frequency.value = note;
+
+        gain.gain.setValueAtTime(0.25, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.2);
+
+        osc.connect(gain);
+        gain.connect(reverbNode);
+        gain.connect(analyser);
+
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.2);
+    }
+
+    function createExplosionSound() {
+        const bufferSize = audioCtx.sampleRate * 0.5;
+        const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+        const data = buffer.getChannelData(0);
+
+        for (let i = 0; i < bufferSize; i++) {
+            data[i] = Math.random() * 2 - 1;
+        }
+
+        const noise = audioCtx.createBufferSource();
+        noise.buffer = buffer;
+
+        const filter = audioCtx.createBiquadFilter();
+        filter.type = 'lowpass';
+        filter.frequency.setValueAtTime(2000, audioCtx.currentTime);
+        filter.frequency.exponentialRampToValueAtTime(50, audioCtx.currentTime + 0.5);
+
+        const gain = audioCtx.createGain();
+        gain.gain.setValueAtTime(0.4, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.5);
+
+        noise.connect(filter);
+        filter.connect(gain);
+        gain.connect(delayNode);
+        gain.connect(reverbNode);
+        gain.connect(analyser);
+
+        noise.start(audioCtx.currentTime);
+        noise.stop(audioCtx.currentTime + 0.5);
+
+        [dorianScale.B3, dorianScale.C4, dorianScale.D4].forEach((freq) => {
+            const osc = audioCtx.createOscillator();
+            const oscGain = audioCtx.createGain();
+
+            osc.type = 'sawtooth';
+            osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(freq * 0.3, audioCtx.currentTime + 0.3);
+
+            oscGain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+            oscGain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
+
+            osc.connect(oscGain);
+            oscGain.connect(reverbNode);
+            oscGain.connect(analyser);
+
+            osc.start(audioCtx.currentTime);
+            osc.stop(audioCtx.currentTime + 0.3);
+        });
+    }
+
+    function createSpawnSound() {
+        const notes = [dorianScale.D4, dorianScale.F4, dorianScale.A4, dorianScale.B4];
+
+        notes.forEach((freq, i) => {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+
+            osc.type = 'triangle';
+            osc.frequency.value = freq;
+
+            const startTime = audioCtx.currentTime + i * 0.06;
+            gain.gain.setValueAtTime(0.15, startTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, startTime + 0.2);
+
+            osc.connect(gain);
+            gain.connect(reverbNode);
+            gain.connect(analyser);
+
+            osc.start(startTime);
+            osc.stop(startTime + 0.2);
+        });
+    }
+
+    function spawnPellet() {
+        pellets.push({
+            x: Math.random() * (canvas.width / 2 - 100) + 50,
+            y: Math.random() * (canvas.height - 180) + 20,
+            radius: 8,
+            color: `hsl(${Math.random() * 360}, 100%, 60%)`,
+            pulse: 0
+        });
+    }
+
+    function activatePowerup() {
+        const powerupTypes = ['rapid_fire', 'spread_shot', 'shield', 'spectrum_heal', 'homing'];
+        const newPowerup = powerupTypes[Math.floor(Math.random() * powerupTypes.length)];
+
+        // Add to powerups array
+        const existingIndex = player.powerups.findIndex(p => p.type === newPowerup);
+
+        if (existingIndex !== -1) {
+            // If already active, extend duration and increase level
+            player.powerups[existingIndex].timer = 300;
+            player.powerups[existingIndex].level = Math.min(3, player.powerups[existingIndex].level + 1);
+            createComboSound(player.powerups[existingIndex].level);
+        } else {
+            // Add new powerup
+            player.powerups.push({
+                type: newPowerup,
+                timer: 300,
+                level: 1
+            });
+            createPowerupSound(newPowerup);
+        }
+
+        updatePowerupDisplay();
+    }
+
+    function updatePowerupDisplay() {
+        const powerupNames = {
+            'rapid_fire': 'RAPID FIRE',
+            'spread_shot': 'SPREAD SHOT',
+            'shield': 'SHIELD',
+            'spectrum_heal': 'SPECTRUM HEAL',
+            'homing': 'HOMING SHOTS'
+        };
+
+        const display = player.powerups.map(p => {
+            const stars = '★'.repeat(p.level);
+            return `${powerupNames[p.type]} ${stars}`;
+        }).join(' | ');
+
+        document.getElementById('powerup').textContent = display || '';
+    }
+
+    function hasPowerup(type) {
+        return player.powerups.some(p => p.type === type);
+    }
+
+    function getPowerupLevel(type) {
+        const powerup = player.powerups.find(p => p.type === type);
+        return powerup ? powerup.level : 0;
+    }
+
+    function playerShoot() {
+        const hasSpread = hasPowerup('spread_shot');
+        const damageLevel = getPowerupLevel('damage_boost');
+
+        if (hasSpread) {
+            const spreadCount = 3 + getPowerupLevel('spread_shot');
+            const spreadAngle = 15;
+
+            for (let i = 0; i < spreadCount; i++) {
+                const angle = (i - Math.floor(spreadCount / 2)) * spreadAngle;
+                bullets.push({
+                    x: player.x + player.width,
+                    y: player.y + player.height / 2,
+                    width: 10,
+                    height: 4,
+                    vx: 8,
+                    vy: Math.sin(angle * Math.PI / 180) * 3,
+                    owner: 'player',
+                    color: player.color,
+                    homing: true,
+                    homingStrength: 0.08,
+                    damage: 10 + damageLevel * 5
+                });
+            }
+            createShootSound(dorianScale.G4);
+        } else {
+            bullets.push({
+                x: player.x + player.width,
+                y: player.y + player.height / 2,
+                width: 10,
+                height: 4,
+                vx: 8,
+                vy: 0,
+                owner: 'player',
+                color: player.color,
+                homing: true,
+                homingStrength: 0.08,
+                damage: 10 + damageLevel * 5
+            });
+            createShootSound(dorianScale.A4);
+        }
+    }
+
+    function enemyShoot(enemy) {
+        bullets.push({
+            x: enemy.x,
+            y: enemy.y + enemy.height / 2,
+            width: 10,
+            height: 4,
+            vx: -6,
+            vy: 0,
+            owner: 'enemy',
+            color: enemy.color
+        });
+        createShootSound(dorianScale.E3);
+    }
+
+    function spawnEnemy() {
+        const newEnemy = {
+            x: canvas.width - 150 - Math.random() * 100,
+            y: Math.random() * (canvas.height - 150) + 50,
+            width: 30,
+            height: 30,
+            speed: 3,
+            health: 100,
+            maxHealth: 100,
+            color: `hsl(${Math.random() * 30}, 100%, 50%)`,
+            shootTimer: Math.random() * 60,
+            shootInterval: 120,
+            isAlive: true
+        };
+        enemies.push(newEnemy);
+        createSpawnSound();
+    }
+
+    function checkCollision(rect1, rect2) {
+        return rect1.x < rect2.x + rect2.width &&
+            rect1.x + rect1.width > rect2.x &&
+            rect1.y < rect2.y + rect2.height &&
+            rect1.y + rect1.height > rect2.y;
+    }
+
+    function checkCircleCollision(circle, rect) {
+        const closestX = Math.max(rect.x, Math.min(circle.x, rect.x + rect.width));
+        const closestY = Math.max(rect.y, Math.min(circle.y, rect.y + rect.height));
+        const distX = circle.x - closestX;
+        const distY = circle.y - closestY;
+        return (distX * distX + distY * distY) < (circle.radius * circle.radius);
+    }
+
+    function drawSpectrum() {
+        analyser.getByteFrequencyData(dataArray);
+
+        const barWidth = (canvas.width / bufferLength) * 2.5;
+        let x = 0;
+
+        const isDangerMode = !hasPowerup('spectrum_heal');
+
+        for (let i = 0; i < bufferLength; i++) {
+            const barHeight = (dataArray[i] / 255) * DANGER_ZONE_HEIGHT;
+
+            let hue;
+            if (isDangerMode) {
+                hue = 0 + (i / bufferLength) * 40;
+            } else {
+                hue = 150 + (i / bufferLength) * 60;
+            }
+
+            ctx.fillStyle = `hsla(${hue}, 100%, 50%, 0.7)`;
+            ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
+
+            x += barWidth + 0.5;
+        }
+
+        ctx.strokeStyle = isDangerMode ? '#ff3333' : '#33ff88';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([5, 5]);
+        ctx.beginPath();
+        ctx.moveTo(0, canvas.height - DANGER_ZONE_HEIGHT);
+        ctx.lineTo(canvas.width, canvas.height - DANGER_ZONE_HEIGHT);
+        ctx.stroke();
+        ctx.setLineDash([]);
+    }
+
+    function update() {
+        if ((keys['w'] || keys['arrowup']) && player.y > 0) player.y -= player.speed;
+        if ((keys['s'] || keys['arrowdown']) && player.y < canvas.height - player.height) player.y += player.speed;
+        if ((keys['a'] || keys['arrowleft']) && player.x > 0) player.x -= player.speed;
+        if ((keys['d'] || keys['arrowright']) && player.x < canvas.width / 2 - player.width) player.x += player.speed;
+
+        // Update powerup timers
+        for (let i = player.powerups.length - 1; i >= 0; i--) {
+            player.powerups[i].timer--;
+            if (player.powerups[i].timer <= 0) {
+                player.powerups.splice(i, 1);
+                updatePowerupDisplay();
+            }
+        }
+
+        maxEnemies = Math.min(1 + Math.floor(enemiesDestroyed / 3), 5);
+        const aliveEnemies = enemies.filter(e => e.isAlive).length;
+        if (aliveEnemies < maxEnemies && Math.random() < 0.01) {
+            spawnEnemy();
+        }
+
+        enemies.forEach(enemy => {
+            if (!enemy.isAlive) return;
+
+            if (Math.random() < 0.02) {
+                enemy.targetY = Math.random() * (canvas.height - enemy.height);
+            }
+            if (enemy.targetY !== undefined) {
+                if (enemy.y < enemy.targetY) enemy.y += enemy.speed;
+                if (enemy.y > enemy.targetY) enemy.y -= enemy.speed;
+            }
+
+            enemy.shootTimer++;
+            if (enemy.shootTimer >= enemy.shootInterval) {
+                enemyShoot(enemy);
+                enemy.shootTimer = 0;
+            }
+        });
+
+        pelletSpawnTimer++;
+        if (pelletSpawnTimer >= 90 && pellets.length < 8) {
+            spawnPellet();
+            pelletSpawnTimer = 0;
+        }
+
+        pellets.forEach(pellet => {
+            pellet.pulse += 0.1;
+        });
+
+        for (let i = pellets.length - 1; i >= 0; i--) {
+            if (checkCircleCollision(pellets[i], player)) {
+                player.score += 10;
+                document.getElementById('score').textContent = player.score;
+                createCollectSound();
+                pellets.splice(i, 1);
+
+                if (player.score % 50 === 0) {
+                    activatePowerup();
+                }
+            }
+        }
+
+        const playerInDangerZone = player.y + player.height > canvas.height - DANGER_ZONE_HEIGHT;
+
+        if (playerInDangerZone) {
+            if (hasPowerup('spectrum_heal')) {
+                const healLevel = getPowerupLevel('spectrum_heal');
+                dangerZoneDamageTimer++;
+                if (dangerZoneDamageTimer >= 30 && player.health < 100) {
+                    player.health = Math.min(100, player.health + (1 + healLevel));
+                    document.getElementById('playerHealth').textContent = player.health;
+                    dangerZoneDamageTimer = 0;
+                }
+            } else {
+                dangerZoneDamageTimer++;
+                if (dangerZoneDamageTimer >= 30) {
+                    player.health = Math.max(0, player.health - 3);
+                    document.getElementById('playerHealth').textContent = player.health;
+                    createHitSound();
+                    dangerZoneDamageTimer = 0;
+                }
+            }
+        } else {
+            dangerZoneDamageTimer = 0;
+        }
+
+        enemies.forEach(enemy => {
+            if (!enemy.isAlive) return;
+            const enemyInDangerZone = enemy.y + enemy.height > canvas.height - DANGER_ZONE_HEIGHT;
+            if (enemyInDangerZone && Math.random() < 0.02) {
+                enemy.health = Math.max(0, enemy.health - 2);
+            }
+        });
+
+        for (let i = bullets.length - 1; i >= 0; i--) {
+            const bullet = bullets[i];
+
+            // Homing behavior for player bullets
+            if (bullet.homing && bullet.owner === 'player' && enemies.length > 0) {
+                let nearestEnemy = null;
+                let nearestDist = Infinity;
+
+                enemies.forEach(enemy => {
+                    if (!enemy.isAlive) return;
+                    const dx = enemy.x - bullet.x;
+                    const dy = enemy.y - bullet.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist < nearestDist) {
+                        nearestDist = dist;
+                        nearestEnemy = enemy;
+                    }
+                });
+
+                if (nearestEnemy) {
+                    const dx = nearestEnemy.x - bullet.x;
+                    const dy = nearestEnemy.y - bullet.y;
+                    const angle = Math.atan2(dy, dx);
+
+                    bullet.vx += Math.cos(angle) * bullet.homingStrength;
+                    bullet.vy += Math.sin(angle) * bullet.homingStrength;
+
+                    // Normalize speed
+                    const speed = Math.sqrt(bullet.vx * bullet.vx + bullet.vy * bullet.vy);
+                    if (speed > 8) {
+                        bullet.vx = (bullet.vx / speed) * 8;
+                        bullet.vy = (bullet.vy / speed) * 8;
+                    }
+                }
+            }
+
+            bullet.x += bullet.vx;
+            bullet.y += bullet.vy;
+
+            if (bullet.x < 0 || bullet.x > canvas.width || bullet.y < 0 || bullet.y > canvas.height) {
+                bullets.splice(i, 1);
+                continue;
+            }
+
+            if (bullet.owner === 'player') {
+                for (let j = 0; j < enemies.length; j++) {
+                    const enemy = enemies[j];
+                    if (enemy.isAlive && checkCollision(bullet, enemy)) {
+                        const damage = bullet.damage || 10;
+                        enemy.health -= damage;
+                        bullets.splice(i, 1);
+                        createHitSound();
+
+                        if (enemy.health <= 0) {
+                            enemy.isAlive = false;
+                            enemiesDestroyed++;
+                            player.score += 50;
+                            document.getElementById('score').textContent = player.score;
+                            createExplosionSound();
+
+                            setTimeout(() => {
+                                const idx = enemies.indexOf(enemy);
+                                if (idx > -1) enemies.splice(idx, 1);
+                            }, 500);
+                        }
+                        break;
+                    }
+                }
+            } else if (bullet.owner === 'enemy' && checkCollision(bullet, player)) {
+                if (hasPowerup('shield')) {
+                    const shieldLevel = getPowerupLevel('shield');
+                    // Higher shield levels have a chance to ignore damage
+                    if (Math.random() > 0.3 * shieldLevel) {
+                        player.health -= 10;
+                        createHitSound();
+                        document.getElementById('playerHealth').textContent = player.health;
+                    }
+                } else {
+                    player.health -= 10;
+                    createHitSound();
+                    document.getElementById('playerHealth').textContent = player.health;
+                }
+                bullets.splice(i, 1);
+            }
+        }
+    }
+
+    function draw() {
+        ctx.fillStyle = 'rgba(13, 13, 31, 0.25)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        drawSpectrum();
+
+        pellets.forEach(pellet => {
+            const pulseSize = Math.sin(pellet.pulse) * 3;
+            ctx.fillStyle = pellet.color;
+            ctx.beginPath();
+            ctx.arc(pellet.x, pellet.y, pellet.radius + pulseSize, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.strokeStyle = pellet.color;
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(pellet.x, pellet.y, pellet.radius + pulseSize + 5, 0, Math.PI * 2);
+            ctx.stroke();
+        });
+
+        // Draw player with enhanced visuals
+        ctx.save();
+
+        const gradient = ctx.createRadialGradient(
+            player.x + player.width/2, player.y + player.height/2, 0,
+            player.x + player.width/2, player.y + player.height/2, 40
+        );
+        gradient.addColorStop(0, 'rgba(0, 255, 136, 0.3)');
+        gradient.addColorStop(1, 'rgba(0, 255, 136, 0)');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(player.x - 20, player.y - 20, player.width + 40, player.height + 40);
+
+        ctx.fillStyle = player.color;
+        ctx.fillRect(player.x, player.y, player.width, player.height);
+
+        ctx.fillStyle = '#88ffcc';
+        ctx.fillRect(player.x + 18, player.y + 10, 8, 10);
+
+        ctx.fillStyle = '#00ffaa';
+        ctx.fillRect(player.x - 3, player.y + 8, 3, 4);
+        ctx.fillRect(player.x - 3, player.y + 18, 3, 4);
+
+        // Visual powerup indicators
+        if (hasPowerup('shield')) {
+            const shieldLevel = getPowerupLevel('shield');
+            ctx.strokeStyle = `rgba(0, 255, 255, ${0.5 + shieldLevel * 0.15})`;
+            ctx.lineWidth = 2 + shieldLevel;
+            ctx.beginPath();
+            ctx.arc(player.x + player.width/2, player.y + player.height/2, 25, 0, Math.PI * 2);
+            ctx.stroke();
+        }
+
+        if (hasPowerup('damage_boost')) {
+            ctx.fillStyle = '#ff3333';
+            for (let i = 0; i < getPowerupLevel('damage_boost'); i++) {
+                ctx.fillRect(player.x + player.width + 2, player.y + 5 + i * 8, 4, 2);
+            }
+        }
+
+        // Always show homing indicator (now standard)
+        ctx.strokeStyle = 'rgba(255, 0, 255, 0.4)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(player.x + player.width/2, player.y + player.height/2, 32, 0, Math.PI * 2);
+        ctx.stroke();
+
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(player.x, player.y, player.width, player.height);
+
+        ctx.restore();
+
+        // Draw enemies with enhanced visuals
+        enemies.forEach(enemy => {
+            if (!enemy.isAlive) {
+                for (let i = 0; i < 8; i++) {
+                    const angle = (i / 8) * Math.PI * 2;
+                    const dist = 20;
+                    ctx.fillStyle = enemy.color;
+                    ctx.fillRect(
+                        enemy.x + enemy.width/2 + Math.cos(angle) * dist - 3,
+                        enemy.y + enemy.height/2 + Math.sin(angle) * dist - 3,
+                        6, 6
+                    );
+                }
+                return;
+            }
+
+            ctx.save();
+
+            const enemyGradient = ctx.createRadialGradient(
+                enemy.x + enemy.width/2, enemy.y + enemy.height/2, 0,
+                enemy.x + enemy.width/2, enemy.y + enemy.height/2, 35
+            );
+            enemyGradient.addColorStop(0, 'rgba(255, 68, 68, 0.3)');
+            enemyGradient.addColorStop(1, 'rgba(255, 68, 68, 0)');
+            ctx.fillStyle = enemyGradient;
+            ctx.fillRect(enemy.x - 15, enemy.y - 15, enemy.width + 30, enemy.height + 30);
+
+            ctx.fillStyle = enemy.color;
+            ctx.fillRect(enemy.x, enemy.y, enemy.width, enemy.height);
+
+            ctx.fillStyle = '#ff8888';
+            ctx.beginPath();
+            ctx.moveTo(enemy.x + 5, enemy.y + enemy.height/2);
+            ctx.lineTo(enemy.x + 15, enemy.y + 8);
+            ctx.lineTo(enemy.x + 15, enemy.y + enemy.height - 8);
+            ctx.fill();
+
+            ctx.fillStyle = '#ffaa00';
+            ctx.fillRect(enemy.x - 2, enemy.y + 10, 4, 3);
+            ctx.fillRect(enemy.x - 2, enemy.y + 17, 4, 3);
+
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 1.5;
+            ctx.strokeRect(enemy.x, enemy.y, enemy.width, enemy.height);
+
+            ctx.fillStyle = enemy.color;
+            ctx.fillRect(enemy.x, enemy.y - 10, (enemy.health / enemy.maxHealth) * enemy.width, 4);
+
+            ctx.restore();
+        });
+
+        bullets.forEach(bullet => {
+            ctx.fillStyle = bullet.color;
+            ctx.fillRect(bullet.x, bullet.y, bullet.width, bullet.height);
+
+            // Homing bullet trail
+            if (bullet.homing && bullet.owner === 'player') {
+                ctx.fillStyle = 'rgba(255, 0, 255, 0.3)';
+                ctx.fillRect(bullet.x - 5, bullet.y, 5, bullet.height);
+            }
+        });
+
+        ctx.fillStyle = player.color;
+        ctx.fillRect(player.x, player.y - 10, (player.health / 100) * player.width, 4);
+    }
+
+    let shootCooldown = 0;
+    function gameLoop() {
+        update();
+        draw();
+
+        const aliveCount = enemies.filter(e => e.isAlive).length;
+        document.getElementById('enemyCount').textContent = aliveCount;
+
+        // Auto rapid-fire if ANY powerup is active
+        const hasAnyPowerup = player.powerups.length > 0;
+        const cooldownRate = hasAnyPowerup ? 5 : 15;
+
+        if (keys[' '] && shootCooldown <= 0) {
+            playerShoot();
+            shootCooldown = cooldownRate;
+        }
+        if (shootCooldown > 0) shootCooldown--;
+
+        requestAnimationFrame(gameLoop);
+    }
+
+    document.addEventListener('keydown', (e) => {
+        keys[e.key.toLowerCase()] = true;
+        if (e.key === ' ') {
+            e.preventDefault();
+        }
+    });
+
+    document.addEventListener('keyup', (e) => {
+        keys[e.key.toLowerCase()] = false;
+    });
+
+    canvas.addEventListener('click', async () => {
+        if (audioCtx.state === 'suspended') {
+            await audioCtx.resume();
+        }
+        await createReverb();
+        startAmbientSound();
+        spawnEnemy();
+        gameLoop();
+    }, { once: true });
+
+    ctx.fillStyle = '#00ff88';
+    ctx.font = '24px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText('Click to Start', canvas.width / 2, canvas.height / 2);
+</script>
+</body>
+</html>
