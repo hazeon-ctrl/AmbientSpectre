@@ -86,10 +86,13 @@
     let enemiesDestroyed = 0;
     let bullets = [];
     let pellets = [];
+    let bombs = [];        // enemy bomb projectiles
+    let explosions = [];   // active bomb blast effects
     const keys = {};
     let pelletSpawnTimer = 0;
     let dangerZoneDamageTimer = 0;
     let shootCooldown = 0;
+    let scoreFlashTimer = 0;  // counts down frames after score increases
 
     // ─── Audio Effects ────────────────────────────────────────────────────────
     let reverbNode = null;
@@ -287,6 +290,52 @@
         });
     }
 
+    function createBombLaunchSound() {
+        // Low thud + rising whine
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(dorianScale.D3, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(dorianScale.B3, audioCtx.currentTime + 0.4);
+        gain.gain.setValueAtTime(0.25, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.4);
+        osc.connect(gain); gain.connect(reverbNode); gain.connect(analyser);
+        connectAndPlay(osc, gain, 0.4);
+    }
+
+    function createBombDetonationSound() {
+        // Deep boom + high shriek
+        const bufferSize = audioCtx.sampleRate * 0.8;
+        const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+        const data = buffer.getChannelData(0);
+        for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+        const noise = audioCtx.createBufferSource();
+        noise.buffer = buffer;
+        const filter = audioCtx.createBiquadFilter();
+        filter.type = 'lowpass';
+        filter.frequency.setValueAtTime(3000, audioCtx.currentTime);
+        filter.frequency.exponentialRampToValueAtTime(40, audioCtx.currentTime + 0.8);
+        filter.Q.value = 3;
+        const gain = audioCtx.createGain();
+        gain.gain.setValueAtTime(0.7, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.8);
+        noise.connect(filter); filter.connect(gain);
+        gain.connect(delayNode); gain.connect(reverbNode); gain.connect(analyser);
+        noise.start(audioCtx.currentTime); noise.stop(audioCtx.currentTime + 0.8);
+        // Pitched shriek overlay
+        [dorianScale.D3 * 0.5, dorianScale.A3].forEach(freq => {
+            const o = audioCtx.createOscillator();
+            const g = audioCtx.createGain();
+            o.type = 'sawtooth';
+            o.frequency.setValueAtTime(freq * 4, audioCtx.currentTime);
+            o.frequency.exponentialRampToValueAtTime(freq * 0.5, audioCtx.currentTime + 0.6);
+            g.gain.setValueAtTime(0.2, audioCtx.currentTime);
+            g.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.6);
+            o.connect(g); g.connect(reverbNode); g.connect(analyser);
+            connectAndPlay(o, g, 0.6);
+        });
+    }
+
     function createSpawnSound() {
         const notes = [dorianScale.D4, dorianScale.F4, dorianScale.A4, dorianScale.B4];
         notes.forEach((freq, i) => {
@@ -402,30 +451,65 @@
     }
 
     function enemyShoot(enemy) {
-        // Aim at player's current Y — no more dumb straight shots
-        const dy = (player.y + player.height / 2) - (enemy.y + enemy.height / 2);
-        const dist = Math.sqrt(36 + dy * dy); // vx component = -6
+        // Aim directly at the player's center using true dx/dy vector
+        const px = player.x + player.width / 2;
+        const py = player.y + player.height / 2;
+        const ex = enemy.x + enemy.width / 2;
+        const ey = enemy.y + enemy.height / 2;
+        const dx = px - ex;
+        const dy = py - ey;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        const speed = enemy.bulletSpeed || 5;
         bullets.push({
-            x: enemy.x,
-            y: enemy.y + enemy.height / 2,
+            x: ex,
+            y: ey,
             width: 10, height: 4,
-            vx: (-6 / dist) * 6,
-            vy: (dy / dist) * 6,
+            vx: (dx / dist) * speed,
+            vy: (dy / dist) * speed,
             owner: 'enemy', color: enemy.color
         });
         createShootSound(dorianScale.E3);
     }
 
+    function enemyLaunchBomb(enemy) {
+        // Lead the player slightly for a predictive lob
+        const px = player.x + player.width / 2;
+        const py = player.y + player.height / 2;
+        const ex = enemy.x + enemy.width / 2;
+        const ey = enemy.y + enemy.height / 2;
+        const BOMB_SPEED = 2.5;
+        const dx = px - ex, dy = py - ey;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        bombs.push({
+            x: ex, y: ey,
+            vx: (dx / dist) * BOMB_SPEED,
+            vy: (dy / dist) * BOMB_SPEED,
+            radius: 10,
+            blastRadius: 90,
+            fuseTimer: 0,
+            fuseDuration: 180,   // 3s at 60fps before detonation
+            damage: 35,
+            phase: 'flying',     // 'flying' | 'armed' | 'detonating'
+            armTimer: 0,
+            armDuration: 60,     // 1s warning pulse before detonation when stopped
+            pulseAngle: 0
+        });
+        createBombLaunchSound();
+    }
     // ─── Enemy Spawning ───────────────────────────────────────────────────────
     function spawnEnemy() {
+        const difficulty = Math.min(enemiesDestroyed / 10, 1);
         enemies.push({
             x: canvas.width - 150 - Math.random() * 100,
             y: Math.random() * (canvas.height - 150) + 50,
-            width: 30, height: 30, speed: 3,
+            width: 30, height: 30, speed: 2 + difficulty,
             health: 100, maxHealth: 100,
             color: `hsl(${Math.random() * 30}, 100%, 50%)`,
-            shootTimer: Math.random() * 60,
-            shootInterval: 120,
+            shootTimer: Math.random() * 40,
+            shootInterval: Math.max(35, 75 - Math.floor(enemiesDestroyed / 3) * 5),
+            bulletSpeed: 4 + difficulty * 3,
+            bombTimer: Math.floor(Math.random() * 300),
+            bombInterval: Math.max(180, 420 - Math.floor(enemiesDestroyed / 2) * 20),
             isAlive: true
         });
         createSpawnSound();
@@ -851,7 +935,111 @@
         });
     }
 
-    // ─── HUD (drawn on canvas) ────────────────────────────────────────────────
+    function drawBombs() {
+        bombs.forEach(bomb => {
+            if (bomb.phase === 'detonating') return; // handled by drawExplosions
+            ctx.save();
+            const t = Date.now() / 1000;
+            bomb.pulseAngle = t * 4;
+
+            if (bomb.phase === 'armed') {
+                // Warning ring — pulsing red danger indicator
+                const armPct = bomb.armTimer / bomb.armDuration;
+                const ringAlpha = 0.15 + 0.35 * Math.abs(Math.sin(t * 12));
+                ctx.strokeStyle = `rgba(255,40,0,${ringAlpha})`;
+                ctx.lineWidth = 2;
+                ctx.setLineDash([6, 4]);
+                ctx.beginPath();
+                ctx.arc(bomb.x, bomb.y, bomb.blastRadius, 0, Math.PI * 2);
+                ctx.stroke();
+                ctx.setLineDash([]);
+                // Countdown fill wedge
+                ctx.fillStyle = `rgba(255,60,0,${0.06 + armPct * 0.1})`;
+                ctx.beginPath();
+                ctx.moveTo(bomb.x, bomb.y);
+                ctx.arc(bomb.x, bomb.y, bomb.blastRadius, -Math.PI / 2, -Math.PI / 2 + armPct * Math.PI * 2);
+                ctx.closePath();
+                ctx.fill();
+            }
+
+            // Bomb body
+            const fuseGlow = bomb.phase === 'armed' ? 1 : (bomb.fuseTimer / bomb.fuseDuration);
+            const bodyGrad = ctx.createRadialGradient(bomb.x - 3, bomb.y - 3, 0, bomb.x, bomb.y, bomb.radius);
+            bodyGrad.addColorStop(0, '#ffee88');
+            bodyGrad.addColorStop(0.5, `hsl(${20 + fuseGlow * 10}, 100%, 45%)`);
+            bodyGrad.addColorStop(1, '#330000');
+            ctx.fillStyle = bodyGrad;
+            ctx.beginPath();
+            ctx.arc(bomb.x, bomb.y, bomb.radius, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = '#ff8800';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+
+            // Spinning danger spikes
+            const spikeCount = 6;
+            ctx.strokeStyle = `rgba(255,${Math.floor(100 + fuseGlow * 100)},0,0.7)`;
+            ctx.lineWidth = 1;
+            for (let s = 0; s < spikeCount; s++) {
+                const a = bomb.pulseAngle + (s / spikeCount) * Math.PI * 2;
+                ctx.beginPath();
+                ctx.moveTo(bomb.x + Math.cos(a) * bomb.radius, bomb.y + Math.sin(a) * bomb.radius);
+                ctx.lineTo(bomb.x + Math.cos(a) * (bomb.radius + 5), bomb.y + Math.sin(a) * (bomb.radius + 5));
+                ctx.stroke();
+            }
+
+            // Fuse spark
+            if (bomb.phase === 'flying') {
+                ctx.fillStyle = `rgba(255,220,0,${0.5 + 0.5 * Math.sin(t * 20)})`;
+                ctx.beginPath();
+                ctx.arc(bomb.x + bomb.radius * 0.7, bomb.y - bomb.radius * 0.7, 2.5, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            ctx.restore();
+        });
+    }
+
+    function drawExplosions() {
+        for (let i = explosions.length - 1; i >= 0; i--) {
+            const ex = explosions[i];
+            ex.frame++;
+            const pct = ex.frame / ex.duration;
+            if (pct >= 1) { explosions.splice(i, 1); continue; }
+
+            ctx.save();
+            // Outer shockwave ring
+            const ringR = ex.blastRadius * pct;
+            const ringAlpha = (1 - pct) * 0.6;
+            ctx.strokeStyle = `rgba(255,160,0,${ringAlpha})`;
+            ctx.lineWidth = 4 * (1 - pct);
+            ctx.beginPath();
+            ctx.arc(ex.x, ex.y, ringR, 0, Math.PI * 2);
+            ctx.stroke();
+
+            // Inner fireball
+            const fireR = ex.blastRadius * 0.55 * (1 - pct * 0.7);
+            const fireGrad = ctx.createRadialGradient(ex.x, ex.y, 0, ex.x, ex.y, fireR);
+            fireGrad.addColorStop(0, `rgba(255,255,200,${(1 - pct) * 0.9})`);
+            fireGrad.addColorStop(0.4, `rgba(255,120,0,${(1 - pct) * 0.7})`);
+            fireGrad.addColorStop(1, 'rgba(180,0,0,0)');
+            ctx.fillStyle = fireGrad;
+            ctx.beginPath();
+            ctx.arc(ex.x, ex.y, fireR, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Debris particles
+            ex.particles.forEach(p => {
+                p.x += p.vx; p.y += p.vy; p.vy += 0.1; // gravity
+                const pa = (1 - pct) * 0.8;
+                ctx.fillStyle = `rgba(255,${Math.floor(80 + Math.random() * 120)},0,${pa})`;
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.r * (1 - pct * 0.5), 0, Math.PI * 2);
+                ctx.fill();
+            });
+            ctx.restore();
+        }
+    }
     function drawHUD() {
         ctx.save();
         ctx.font = 'bold 13px Courier New';
@@ -873,10 +1061,43 @@
         ctx.font = '10px Courier New';
         ctx.fillText(player.health, 140, 20);
 
-        // Score
+        // Score — top bar small display
         ctx.font = 'bold 13px Courier New';
         ctx.fillStyle = '#88ccff';
         ctx.fillText(`SCORE  ${player.score}`, 200, 20);
+
+        ctx.restore();
+
+        // ── Large flashing score (drawn separately, outside top-bar save/restore) ──
+        if (scoreFlashTimer > 0) {
+            scoreFlashTimer--;
+            const flashPct = scoreFlashTimer / 40; // 1.0 → 0
+            const scale = 1 + flashPct * 0.5;
+            const alpha = 0.6 + flashPct * 0.4;
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            ctx.font = `bold ${Math.round(28 * scale)}px Courier New`;
+            ctx.textAlign = 'center';
+            ctx.shadowColor = '#88ccff';
+            ctx.shadowBlur = 12 + flashPct * 20;
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText(player.score, canvas.width / 2, 80);
+            ctx.shadowBlur = 0;
+            ctx.restore();
+        } else {
+            // Steady small score anchored center-top at all times
+            ctx.save();
+            ctx.globalAlpha = 0.55;
+            ctx.font = 'bold 20px Courier New';
+            ctx.textAlign = 'center';
+            ctx.fillStyle = '#88ccff';
+            ctx.fillText(player.score, canvas.width / 2, 80);
+            ctx.restore();
+        }
+
+        ctx.save(); // re-open save for the powerup bars below
+        ctx.font = 'bold 13px Courier New';
+        ctx.textAlign = 'left';
 
         // Enemies alive
         const alive = enemies.filter(e => e.isAlive).length;
@@ -979,6 +1200,7 @@
             '',
             'Power-ups stack and can level up to ★★★',
             'Enemy bullets now aim at you — stay moving!',
+            '💣 BOMB ALERT — enemies launch blast-radius bombs!',
         ];
 
         ctx.fillStyle = 'rgba(255,255,255,0.75)';
@@ -1049,23 +1271,39 @@
             if (player.powerups[i].timer <= 0) player.powerups.splice(i, 1);
         }
 
-        // Enemy scaling
-        maxEnemies = Math.min(1 + Math.floor(enemiesDestroyed / 3), 5);
+        // Enemy scaling — higher cap, quicker ramp
+        maxEnemies = Math.min(2 + Math.floor(enemiesDestroyed / 2), 8);
         const aliveEnemies = enemies.filter(e => e.isAlive).length;
-        if (aliveEnemies < maxEnemies && Math.random() < 0.01) spawnEnemy();
+        if (aliveEnemies < maxEnemies && Math.random() < 0.015) spawnEnemy();
 
         // Enemy AI
         enemies.forEach(enemy => {
             if (!enemy.isAlive) return;
+
+            // Actively track the player's Y center, with occasional random drift for variety
+            const playerCY = player.y + player.height / 2;
+            const enemyCY  = enemy.y  + enemy.height  / 2;
+            const trackBias = 0.7;
             if (Math.random() < 0.02) enemy.targetY = Math.random() * (canvas.height - enemy.height);
-            if (enemy.targetY !== undefined) {
-                if (enemy.y < enemy.targetY) enemy.y += enemy.speed;
-                if (enemy.y > enemy.targetY) enemy.y -= enemy.speed;
+            const blendedTarget = playerCY * trackBias + (enemy.targetY ?? playerCY) * (1 - trackBias);
+            const dyToTarget = blendedTarget - enemyCY;
+            if (Math.abs(dyToTarget) > 1) {
+                enemy.y += Math.sign(dyToTarget) * Math.min(enemy.speed, Math.abs(dyToTarget));
             }
+            enemy.y = Math.max(0, Math.min(canvas.height - enemy.height - DANGER_ZONE_HEIGHT, enemy.y));
+
+            // Regular shots
             enemy.shootTimer++;
             if (enemy.shootTimer >= enemy.shootInterval) {
                 enemyShoot(enemy);
                 enemy.shootTimer = 0;
+            }
+
+            // Bomb attack
+            enemy.bombTimer++;
+            if (enemy.bombTimer >= enemy.bombInterval) {
+                enemyLaunchBomb(enemy);
+                enemy.bombTimer = 0;
             }
         });
 
@@ -1081,6 +1319,7 @@
         for (let i = pellets.length - 1; i >= 0; i--) {
             if (checkCircleCollision(pellets[i], player)) {
                 player.score += 10;
+                scoreFlashTimer = 30;
                 createCollectSound();
                 pellets.splice(i, 1);
 
@@ -1119,21 +1358,101 @@
             }
         });
 
+        // ── Bomb update ──────────────────────────────────────────────────────
+        for (let i = bombs.length - 1; i >= 0; i--) {
+            const bomb = bombs[i];
+
+            if (bomb.phase === 'flying') {
+                bomb.x += bomb.vx;
+                bomb.y += bomb.vy;
+                bomb.fuseTimer++;
+                // Out of bounds — remove
+                if (bomb.x < 0 || bomb.x > canvas.width || bomb.y < 0 || bomb.y > canvas.height) {
+                    bombs.splice(i, 1); continue;
+                }
+                // Fuse expires OR bomb reaches player proximity → arm it
+                const toPx = bomb.x - (player.x + player.width / 2);
+                const toPy = bomb.y - (player.y + player.height / 2);
+                const toPlayer = Math.sqrt(toPx * toPx + toPy * toPy);
+                if (bomb.fuseTimer >= bomb.fuseDuration || toPlayer < bomb.blastRadius * 0.6) {
+                    bomb.phase = 'armed';
+                    bomb.vx = 0; bomb.vy = 0;
+                }
+            } else if (bomb.phase === 'armed') {
+                bomb.armTimer++;
+                if (bomb.armTimer >= bomb.armDuration) {
+                    // Detonate!
+                    bomb.phase = 'detonating';
+                    createBombDetonationSound();
+                    // Check player in blast radius
+                    const dx = player.x + player.width / 2 - bomb.x;
+                    const dy = player.y + player.height / 2 - bomb.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist < bomb.blastRadius) {
+                        const falloff = 1 - dist / bomb.blastRadius;
+                        let dmg = Math.round(bomb.damage * falloff);
+                        if (hasPowerup('shield')) {
+                            const shieldLevel = getPowerupLevel('shield');
+                            if (Math.random() > 0.3 * shieldLevel) { player.health -= dmg; createHitSound(); }
+                        } else {
+                            player.health -= dmg;
+                            createHitSound();
+                        }
+                    }
+                    // Spawn explosion effect
+                    const particles = [];
+                    for (let p = 0; p < 18; p++) {
+                        const angle = Math.random() * Math.PI * 2;
+                        const speed = 1.5 + Math.random() * 4;
+                        particles.push({ x: bomb.x, y: bomb.y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed - 1, r: 2 + Math.random() * 4 });
+                    }
+                    explosions.push({ x: bomb.x, y: bomb.y, blastRadius: bomb.blastRadius, frame: 0, duration: 45, particles });
+                    bombs.splice(i, 1);
+                }
+            }
+        }
+
         // Bullet movement & collision
-        for (let i = bullets.length - 1; i >= 0; i--) {
+        const bulletsToRemove = new Set();
+
+        for (let i = 0; i < bullets.length; i++) {
+            if (bulletsToRemove.has(i)) continue;
             const bullet = bullets[i];
 
-            // Homing (always on for player — core ability)
+            // Homing — diverts to intercept nearby enemy bullets/bombs, else targets nearest enemy
             if (bullet.homing && bullet.owner === 'player') {
-                let nearestEnemy = null, nearestDist = Infinity;
-                enemies.forEach(enemy => {
-                    if (!enemy.isAlive) return;
-                    const dx = enemy.x - bullet.x, dy = enemy.y - bullet.y;
-                    const dist = Math.sqrt(dx * dx + dy * dy);
-                    if (dist < nearestDist) { nearestDist = dist; nearestEnemy = enemy; }
-                });
-                if (nearestEnemy) {
-                    const dx = nearestEnemy.x - bullet.x, dy = nearestEnemy.y - bullet.y;
+                let homingTarget = null, homingDist = Infinity;
+
+                // Nearby enemy bullets (within 180px)
+                for (let j = 0; j < bullets.length; j++) {
+                    if (bulletsToRemove.has(j)) continue;
+                    const b = bullets[j];
+                    if (b.owner !== 'enemy') continue;
+                    const dx = b.x - bullet.x, dy = b.y - bullet.y;
+                    const d = Math.sqrt(dx * dx + dy * dy);
+                    if (d < 180 && d < homingDist) { homingDist = d; homingTarget = { x: b.x, y: b.y }; }
+                }
+
+                // Nearby bombs (within 220px)
+                for (let k = 0; k < bombs.length; k++) {
+                    const bomb = bombs[k];
+                    const dx = bomb.x - bullet.x, dy = bomb.y - bullet.y;
+                    const d = Math.sqrt(dx * dx + dy * dy);
+                    if (d < 220 && d < homingDist) { homingDist = d; homingTarget = { x: bomb.x, y: bomb.y }; }
+                }
+
+                // Fallback: nearest enemy ship
+                if (!homingTarget) {
+                    enemies.forEach(enemy => {
+                        if (!enemy.isAlive) return;
+                        const dx = enemy.x + enemy.width / 2 - bullet.x, dy = enemy.y + enemy.height / 2 - bullet.y;
+                        const d = Math.sqrt(dx * dx + dy * dy);
+                        if (d < homingDist) { homingDist = d; homingTarget = { x: enemy.x + enemy.width / 2, y: enemy.y + enemy.height / 2 }; }
+                    });
+                }
+
+                if (homingTarget) {
+                    const dx = homingTarget.x - bullet.x, dy = homingTarget.y - bullet.y;
                     const angle = Math.atan2(dy, dx);
                     bullet.vx += Math.cos(angle) * bullet.homingStrength;
                     bullet.vy += Math.sin(angle) * bullet.homingStrength;
@@ -1146,22 +1465,66 @@
             bullet.y += bullet.vy;
 
             if (bullet.x < 0 || bullet.x > canvas.width || bullet.y < 0 || bullet.y > canvas.height) {
-                bullets.splice(i, 1);
+                bulletsToRemove.add(i);
                 continue;
             }
 
             if (bullet.owner === 'player') {
                 let hit = false;
+
+                // Intercept enemy bullets
+                for (let j = 0; j < bullets.length; j++) {
+                    if (j === i || bulletsToRemove.has(j)) continue;
+                    const eb = bullets[j];
+                    if (eb.owner !== 'enemy') continue;
+                    const dx = eb.x - bullet.x, dy = eb.y - bullet.y;
+                    if (Math.sqrt(dx * dx + dy * dy) < 12) {
+                        bulletsToRemove.add(i);
+                        bulletsToRemove.add(j);
+                        createHitSound();
+                        player.score += 5;
+                        scoreFlashTimer = 18;
+                        hit = true;
+                        break;
+                    }
+                }
+                if (hit) continue;
+
+                // Intercept bombs
+                for (let k = bombs.length - 1; k >= 0; k--) {
+                    const bomb = bombs[k];
+                    const dx = bomb.x - bullet.x, dy = bomb.y - bullet.y;
+                    if (Math.sqrt(dx * dx + dy * dy) < bomb.radius + 8) {
+                        const bx = bomb.x, by = bomb.y;
+                        bombs.splice(k, 1);
+                        bulletsToRemove.add(i);
+                        createHitSound();
+                        player.score += 15;
+                        scoreFlashTimer = 25;
+                        const particles = [];
+                        for (let p = 0; p < 10; p++) {
+                            const a = Math.random() * Math.PI * 2, s = 1 + Math.random() * 3;
+                            particles.push({ x: bx, y: by, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 0.5, r: 2 + Math.random() * 3 });
+                        }
+                        explosions.push({ x: bx, y: by, blastRadius: 40, frame: 0, duration: 28, particles });
+                        hit = true;
+                        break;
+                    }
+                }
+                if (hit) continue;
+
+                // Hit enemy ships
                 for (let j = 0; j < enemies.length; j++) {
                     const enemy = enemies[j];
                     if (enemy.isAlive && checkCollision(bullet, enemy)) {
                         enemy.health -= bullet.damage || 10;
-                        bullets.splice(i, 1);
+                        bulletsToRemove.add(i);
                         createHitSound();
                         if (enemy.health <= 0) {
                             enemy.isAlive = false;
                             enemiesDestroyed++;
                             player.score += 50;
+                            scoreFlashTimer = 40;
                             createExplosionSound();
                             setTimeout(() => {
                                 const idx = enemies.indexOf(enemy);
@@ -1173,6 +1536,7 @@
                     }
                 }
                 if (hit) continue;
+
             } else if (bullet.owner === 'enemy' && checkCollision(bullet, player)) {
                 if (hasPowerup('shield')) {
                     const shieldLevel = getPowerupLevel('shield');
@@ -1184,9 +1548,13 @@
                     player.health -= 10;
                     createHitSound();
                 }
-                bullets.splice(i, 1);
+                bulletsToRemove.add(i);
             }
         }
+
+        // Apply all bullet removals in one reverse pass — safe, no index corruption
+        const removeArr = [...bulletsToRemove].sort((a, b) => b - a);
+        for (const idx of removeArr) bullets.splice(idx, 1);
 
         // Death check
         if (player.health <= 0) {
@@ -1225,13 +1593,15 @@
         drawPlayer();
         drawEnemies();
         drawBullets();
+        drawBombs();
+        drawExplosions();
         drawHUD();
         drawControls();
 
         // Shooting
         const hasAnyPowerup = player.powerups.length > 0;
         const cooldownRate = hasAnyPowerup && hasPowerup('rapid_fire') ? 5 : 15;
-        if (keys[' '] && shootCooldown <= 0) {
+        if (shootCooldown <= 0) {
             playerShoot();
             shootCooldown = cooldownRate;
         }
@@ -1246,8 +1616,9 @@
         player.health = 100; player.score = 0;
         player.powerups = []; player.lastPowerupScore = 0;
         enemies.length = 0; bullets.length = 0; pellets.length = 0;
+        bombs.length = 0; explosions.length = 0;
         enemiesDestroyed = 0; maxEnemies = 1;
-        pelletSpawnTimer = 0; dangerZoneDamageTimer = 0; shootCooldown = 0;
+        pelletSpawnTimer = 0; dangerZoneDamageTimer = 0; shootCooldown = 0; scoreFlashTimer = 0;
         gameState = 'playing';
         spawnEnemy();
     }
