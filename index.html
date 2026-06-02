@@ -94,6 +94,13 @@
     let shootCooldown = 0;
     let scoreFlashTimer = 0;  // counts down frames after score increases
 
+    // ─── Spectrum Immersion State ─────────────────────────────────────────────
+    let spectrumImmersed = false;   // true when player is in heal zone with spectrum_heal
+    let spectrumDashDir = 1;        // current horizontal dash direction: +1 or -1
+    let spectrumDashSpeed = 7;      // px/frame dash speed
+    let spectrumDashTimer = 0;      // counts frames since last direction flip
+    const SPECTRUM_DASH_INTERVAL = 22; // frames between direction flips (~0.37s)
+
     // ─── AMBIENT Combo System ─────────────────────────────────────────────────
     const AMBIENT_WORD = 'AMBIENT';
     let ambientLettersRevealed = 0;  // 0–7; 7 = full word = triggers clear
@@ -727,6 +734,32 @@
             ctx.shadowBlur = 0;
         }
 
+        // ── Spectrum Immersion aura ──
+        if (spectrumImmersed) {
+            const t = Date.now() / 400;
+            const hue = (t * 60) % 360;
+            // Outer rotating rainbow ring
+            ctx.shadowColor = `hsl(${hue}, 100%, 60%)`;
+            ctx.shadowBlur = 22;
+            ctx.strokeStyle = `hsla(${hue}, 100%, 65%, 0.85)`;
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.arc(cx, cy, 36, 0, Math.PI * 2);
+            ctx.stroke();
+            // Second ring offset
+            ctx.strokeStyle = `hsla(${(hue + 120) % 360}, 100%, 65%, 0.5)`;
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.arc(cx, cy, 42, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.shadowBlur = 0;
+            // "IMMERSED" label above ship
+            ctx.font = 'bold 9px Courier New';
+            ctx.textAlign = 'center';
+            ctx.fillStyle = `hsla(${hue}, 100%, 75%, 0.9)`;
+            ctx.fillText('✦ IMMERSED ✦', cx, player.y - 20);
+        }
+
         // ── Homing aura (always-on core ability) — soft magenta ring ──
         ctx.strokeStyle = 'rgba(255, 0, 255, 0.3)';
         ctx.lineWidth = 1;
@@ -946,8 +979,34 @@
     }
 
     function drawPellets() {
+        const hasActiveCombo = player.powerups.length > 0;
+        const pcx = player.x + player.width / 2;
+        const pcy = player.y + player.height / 2;
+        const ATTRACT_RADIUS = 190;
+
         pellets.forEach(pellet => {
             const pulseSize = Math.sin(pellet.pulse) * 3;
+
+            // Tether line toward player when combo is active and in range
+            if (hasActiveCombo) {
+                const dx = pcx - pellet.x;
+                const dy = pcy - pellet.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist < ATTRACT_RADIUS) {
+                    const alpha = (1 - dist / ATTRACT_RADIUS) * 0.45;
+                    ctx.save();
+                    ctx.strokeStyle = pellet.color.replace(')', `, ${alpha})`).replace('hsl', 'hsla');
+                    ctx.lineWidth = 1;
+                    ctx.setLineDash([4, 6]);
+                    ctx.beginPath();
+                    ctx.moveTo(pellet.x, pellet.y);
+                    ctx.lineTo(pcx, pcy);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                    ctx.restore();
+                }
+            }
+
             ctx.fillStyle = pellet.color;
             ctx.beginPath();
             ctx.arc(pellet.x, pellet.y, pellet.radius + pulseSize, 0, Math.PI * 2);
@@ -1175,7 +1234,7 @@
         ctx.fillStyle = 'rgba(136,204,255,0.7)';
         ctx.font = '10px Courier New';
         ctx.textAlign = 'center';
-        ctx.fillText('WASD / ARROWS: Move   SPACE: Shoot   Collect pellets → power-ups   DANGER ZONE at bottom!', canvas.width / 2, canvas.height - 5);
+        ctx.fillText('WASD / ARROWS: Move   SPACE: Shoot   Collect pellets → power-ups   ♥ SPECTRUM HEAL: full invincibility in HEAL ZONE!', canvas.width / 2, canvas.height - 5);
         ctx.restore();
     }
 
@@ -1276,7 +1335,7 @@
             '⚡ RAPID FIRE — faster shooting rate',
             '✦ SPREAD SHOT — multi-directional burst',
             '◈ SHIELD — absorb enemy fire',
-            '♥ SPECTRUM HEAL — heal in the danger zone below',
+            '♥ SPECTRUM HEAL — dive into heal zone: full HP, invincible, erratic dash',
             '▲ DAMAGE BOOST — hit harder',
             '',
             'Power-ups stack and can level up to ★★★',
@@ -1438,7 +1497,26 @@
             spawnPellet();
             pelletSpawnTimer = 0;
         }
-        pellets.forEach(p => p.pulse += 0.1);
+        // Pellet pulse + combo attraction
+        const hasActiveCombo = player.powerups.length > 0;
+        const pcx = player.x + player.width / 2;
+        const pcy = player.y + player.height / 2;
+        const ATTRACT_RADIUS = 190;
+        const ATTRACT_SPEED  = 2.8;
+        pellets.forEach(p => {
+            p.pulse += 0.1;
+            if (hasActiveCombo) {
+                const dx = pcx - p.x;
+                const dy = pcy - p.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist < ATTRACT_RADIUS && dist > 1) {
+                    // Stronger pull the closer it gets
+                    const strength = ATTRACT_SPEED * (1 - dist / ATTRACT_RADIUS) * 1.6;
+                    p.x += (dx / dist) * strength;
+                    p.y += (dy / dist) * strength;
+                }
+            }
+        });
 
         // Pellet collection
         for (let i = pellets.length - 1; i >= 0; i--) {
@@ -1455,24 +1533,39 @@
             }
         }
 
-        // Danger zone
+        // Danger zone / Spectrum Immersion
         const inDanger = player.y + player.height > canvas.height - DANGER_ZONE_HEIGHT;
+        spectrumImmersed = inDanger && hasPowerup('spectrum_heal');
+
         if (inDanger) {
-            dangerZoneDamageTimer++;
-            if (dangerZoneDamageTimer >= 30) {
-                if (hasPowerup('spectrum_heal')) {
-                    const level = getPowerupLevel('spectrum_heal');
-                    if (player.health < 100) {
-                        player.health = Math.min(100, player.health + (1 + level));
-                    }
-                } else {
+            if (hasPowerup('spectrum_heal')) {
+                // Full instant heal every frame while immersed
+                player.health = 100;
+
+                // Erratic horizontal dash — override player X input
+                spectrumDashTimer++;
+                if (spectrumDashTimer >= SPECTRUM_DASH_INTERVAL) {
+                    spectrumDashDir *= -1;
+                    spectrumDashTimer = 0;
+                }
+                const newX = player.x + spectrumDashDir * spectrumDashSpeed;
+                // Bounce within left half
+                if (newX <= 0 || newX >= canvas.width / 2 - player.width) {
+                    spectrumDashDir *= -1;
+                    spectrumDashTimer = 0;
+                }
+                player.x = Math.max(0, Math.min(canvas.width / 2 - player.width, player.x + spectrumDashDir * spectrumDashSpeed));
+            } else {
+                dangerZoneDamageTimer++;
+                if (dangerZoneDamageTimer >= 30) {
                     player.health = Math.max(0, player.health - 3);
                     createHitSound();
+                    dangerZoneDamageTimer = 0;
                 }
-                dangerZoneDamageTimer = 0;
             }
         } else {
             dangerZoneDamageTimer = 0;
+            spectrumDashTimer = 0;
         }
 
         // Enemies hurt in danger zone
@@ -1516,7 +1609,9 @@
                     if (dist < bomb.blastRadius) {
                         const falloff = 1 - dist / bomb.blastRadius;
                         let dmg = Math.round(bomb.damage * falloff);
-                        if (hasPowerup('shield')) {
+                        if (spectrumImmersed) {
+                            // Invincible — no damage
+                        } else if (hasPowerup('shield')) {
                             const shieldLevel = getPowerupLevel('shield');
                             if (Math.random() > 0.3 * shieldLevel) { player.health -= dmg; createHitSound(); }
                         } else {
@@ -1671,7 +1766,10 @@
                 if (hit) continue;
 
             } else if (bullet.owner === 'enemy' && checkCollision(bullet, player)) {
-                if (hasPowerup('shield')) {
+                if (spectrumImmersed) {
+                    // Deflect — bullet removed but no damage
+                    bulletsToRemove.add(i);
+                } else if (hasPowerup('shield')) {
                     const shieldLevel = getPowerupLevel('shield');
                     if (Math.random() > 0.3 * shieldLevel) {
                         player.health -= 10;
@@ -1754,6 +1852,7 @@
         enemiesDestroyed = 0; maxEnemies = 1;
         pelletSpawnTimer = 0; dangerZoneDamageTimer = 0; shootCooldown = 0; scoreFlashTimer = 0;
         ambientLettersRevealed = 0; ambientComboTimer = 0; ambientClearFlash = 0;
+        spectrumImmersed = false; spectrumDashDir = 1; spectrumDashTimer = 0;
         gameState = 'playing';
         spawnEnemy();
     }
