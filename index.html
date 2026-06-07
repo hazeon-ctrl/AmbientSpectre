@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Audio Spectrum Shooter</title>
+    <title>Ambient Spectre</title>
     <style>
         * { box-sizing: border-box; }
         body {
@@ -108,6 +108,26 @@
     let ambientComboTimer = 0;       // counts down; resets combo if it hits 0
     const AMBIENT_COMBO_WINDOW = 180; // ~3 seconds at 60fps to chain kills
     let ambientClearFlash = 0;       // flash effect when word completes
+
+    // ─── Ambience State ───────────────────────────────────────────────────────
+    // Stars: spawned on each enemy kill, faintly glowing, permanent
+    let ambienceStars = [];
+    // Motes: horizontal scrolling dust particles, one cluster per combo
+    let ambienceMotes = [];
+    // Constellation flash state
+    let constellationFlash = 0;      // countdown frames for the full AMBIENT reveal
+    const CONSTELLATION_DURATION = 180; // ~3s at 60fps
+    // Fixed constellation node positions (seeded set of star-like anchor points)
+    const CONSTELLATION_NODES = [
+        {x: 680, y: 80}, {x: 730, y: 140}, {x: 760, y: 60}, {x: 710, y: 200},
+        {x: 640, y: 160}, {x: 780, y: 180}, {x: 650, y: 40}, {x: 700, y: 110},
+        {x: 590, y: 90}, {x: 620, y: 200}, {x: 560, y: 150}, {x: 540, y: 60}
+    ];
+    // Constellation edges (pairs of node indices)
+    const CONSTELLATION_EDGES = [
+        [0,1],[1,2],[0,7],[7,8],[8,10],[10,9],[9,3],[3,4],[4,0],[4,6],
+        [1,5],[5,3],[6,8],[7,11],[11,10]
+    ];
 
     // ─── Audio Effects ────────────────────────────────────────────────────────
     let reverbNode = null;
@@ -582,6 +602,192 @@
         const cy = Math.max(rect.y, Math.min(circle.y, rect.y + rect.height));
         const dx = circle.x - cx, dy = circle.y - cy;
         return dx * dx + dy * dy < circle.radius * circle.radius;
+    }
+
+    // ─── Ambience Drawing ─────────────────────────────────────────────────────
+    function drawAmbience() {
+        const now = Date.now();
+
+        // ── Stars (permanent, one per kill) ──────────────────────────────────
+        ambienceStars.forEach(star => {
+            // Each star has a slow twinkle
+            const twinkle = 0.4 + 0.6 * Math.abs(Math.sin(now / star.twinklePeriod + star.twinkleOffset));
+            const flashBoost = constellationFlash > 0 ? (constellationFlash / CONSTELLATION_DURATION) * 0.9 : 0;
+            const alpha = Math.min(1, (star.baseAlpha + flashBoost) * twinkle);
+            const radius = star.r * (1 + flashBoost * 2.5);
+
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            // Outer glow
+            const grad = ctx.createRadialGradient(star.x, star.y, 0, star.x, star.y, radius * 4);
+            grad.addColorStop(0, star.color);
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            ctx.arc(star.x, star.y, radius * 4, 0, Math.PI * 2);
+            ctx.fill();
+            // Core dot
+            ctx.fillStyle = '#ffffff';
+            ctx.beginPath();
+            ctx.arc(star.x, star.y, radius * (1 + flashBoost), 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+        });
+
+        // ── Sky reveal on constellation flash ────────────────────────────────
+        if (constellationFlash > 0) {
+            const pct = constellationFlash / CONSTELLATION_DURATION;
+            // Sky builds up, peaks, then fades
+            const skyAlpha = pct < 0.15
+                ? (pct / 0.15) * 0.28          // fade in
+                : pct > 0.75
+                    ? ((pct - 0.75) / 0.25) * 0.28  // fade out
+                    : 0.28;                           // plateau
+
+            // Deep-space to light-blue gradient sky wash
+            const skyGrad = ctx.createLinearGradient(0, 0, 0, canvas.height - 120);
+            skyGrad.addColorStop(0,   `rgba(10, 20, 60,  ${skyAlpha * 0.6})`);
+            skyGrad.addColorStop(0.35,`rgba(20, 55, 120, ${skyAlpha})`);
+            skyGrad.addColorStop(0.65,`rgba(80, 140, 200,${skyAlpha})`);
+            skyGrad.addColorStop(1,   `rgba(140,200,240, ${skyAlpha * 0.7})`);
+            ctx.fillStyle = skyGrad;
+            ctx.fillRect(0, 0, canvas.width, canvas.height - 120);
+
+            // Nebula cloud wisps — soft overlapping ellipses
+            const cloudSeeds = [
+                {cx: 150, cy: 140, rx: 200, ry: 60, hue: 210},
+                {cx: 500, cy: 90,  rx: 220, ry: 55, hue: 200},
+                {cx: 350, cy: 200, rx: 180, ry: 50, hue: 220},
+                {cx: 650, cy: 160, rx: 150, ry: 45, hue: 195},
+                {cx: 80,  cy: 280, rx: 160, ry: 50, hue: 215},
+                {cx: 700, cy: 280, rx: 170, ry: 55, hue: 205},
+            ];
+            cloudSeeds.forEach(c => {
+                const cloudAlpha = skyAlpha * (0.5 + 0.2 * Math.sin(now / 4000 + c.cx));
+                const cg = ctx.createRadialGradient(c.cx, c.cy, 0, c.cx, c.cy, c.rx);
+                cg.addColorStop(0, `hsla(${c.hue}, 60%, 80%, ${cloudAlpha * 0.6})`);
+                cg.addColorStop(0.5, `hsla(${c.hue}, 50%, 70%, ${cloudAlpha * 0.3})`);
+                cg.addColorStop(1, 'rgba(0,0,0,0)');
+                ctx.save();
+                ctx.scale(1, c.ry / c.rx);
+                ctx.fillStyle = cg;
+                ctx.beginPath();
+                ctx.arc(c.cx, c.cy * (c.rx / c.ry), c.rx, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+            });
+
+            // ── Constellation lines connecting nearest stars ──────────────────
+            const lineAlpha = skyAlpha * 1.8;
+            ctx.save();
+            ctx.globalAlpha = Math.min(1, lineAlpha);
+            ctx.strokeStyle = `rgba(160, 210, 255, ${Math.min(1, lineAlpha)})`;
+            ctx.lineWidth = 0.8;
+            ctx.shadowColor = '#88ccff';
+            ctx.shadowBlur = 8;
+
+            // Connect the fixed constellation skeleton
+            CONSTELLATION_EDGES.forEach(([a, b]) => {
+                const na = CONSTELLATION_NODES[a];
+                const nb = CONSTELLATION_NODES[b];
+                ctx.beginPath();
+                ctx.moveTo(na.x, na.y);
+                ctx.lineTo(nb.x, nb.y);
+                ctx.stroke();
+            });
+
+            // Also connect any accumulated stars to their nearest neighbor
+            if (ambienceStars.length >= 2) {
+                ctx.strokeStyle = `rgba(130, 200, 255, ${Math.min(1, lineAlpha * 0.6)})`;
+                ctx.lineWidth = 0.5;
+                ctx.shadowBlur = 4;
+                // Connect each star to its nearest star (simple nearest-neighbor chains)
+                ambienceStars.forEach((star, idx) => {
+                    let nearest = null, nearestD = Infinity;
+                    ambienceStars.forEach((other, jdx) => {
+                        if (jdx === idx) return;
+                        const d = Math.hypot(other.x - star.x, other.y - star.y);
+                        if (d < nearestD && d < 200) { nearestD = d; nearest = other; }
+                    });
+                    if (nearest) {
+                        ctx.beginPath();
+                        ctx.moveTo(star.x, star.y);
+                        ctx.lineTo(nearest.x, nearest.y);
+                        ctx.stroke();
+                    }
+                });
+            }
+            ctx.restore();
+
+            // Decrement
+            constellationFlash--;
+        }
+
+        // ── Motes (horizontal scrolling space dust) ───────────────────────────
+        for (let i = ambienceMotes.length - 1; i >= 0; i--) {
+            const mote = ambienceMotes[i];
+            mote.x -= mote.speed;
+            mote.life--;
+
+            if (mote.x < -10 || mote.life <= 0) {
+                ambienceMotes.splice(i, 1);
+                continue;
+            }
+
+            const agePct = mote.life / mote.maxLife;
+            // Fade in quickly, then fade out
+            const fadeAlpha = agePct < 0.1 ? agePct / 0.1 : agePct > 0.8 ? (agePct - 0.8) / 0.2 : 1;
+            const alpha = mote.baseAlpha * fadeAlpha;
+
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            // Elongated streak — faster motes are more elongated
+            const streakLen = mote.speed * 6;
+            const motGrad = ctx.createLinearGradient(mote.x, mote.y, mote.x + streakLen, mote.y);
+            motGrad.addColorStop(0, 'rgba(0,0,0,0)');
+            motGrad.addColorStop(0.3, mote.color);
+            motGrad.addColorStop(1, mote.color);
+            ctx.fillStyle = motGrad;
+            ctx.beginPath();
+            ctx.ellipse(mote.x + streakLen / 2, mote.y, streakLen / 2, mote.r, 0, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+        }
+    }
+
+    function spawnMoteCluster() {
+        // Spawn a cluster of ~8–14 motes at the right edge, varying Y band
+        const count = 8 + Math.floor(Math.random() * 7);
+        const centerY = 60 + Math.random() * (canvas.height - 200);
+        for (let i = 0; i < count; i++) {
+            ambienceMotes.push({
+                x: canvas.width + 10 + Math.random() * 80,
+                y: centerY + (Math.random() - 0.5) * 80,
+                speed: 0.6 + Math.random() * 1.4,
+                r: 0.5 + Math.random() * 1.2,
+                life: 260 + Math.floor(Math.random() * 120),
+                maxLife: 380,
+                baseAlpha: 0.15 + Math.random() * 0.35,
+                color: `hsl(${180 + Math.random() * 60}, 60%, ${70 + Math.random() * 20}%)`
+            });
+        }
+    }
+
+    function spawnKillStar(enemy) {
+        // Place a small star near the enemy's last known position, avoiding HUD areas
+        const sx = enemy.x + enemy.width / 2 + (Math.random() - 0.5) * 40;
+        const sy = Math.max(55, Math.min(canvas.height - 140,
+            enemy.y + enemy.height / 2 + (Math.random() - 0.5) * 40));
+        const hue = 180 + Math.random() * 80; // cool blues/cyans/teals
+        ambienceStars.push({
+            x: sx,
+            y: sy,
+            r: 0.6 + Math.random() * 1.0,
+            baseAlpha: 0.18 + Math.random() * 0.22,
+            color: `hsl(${hue}, 80%, 75%)`,
+            twinklePeriod: 1800 + Math.random() * 3000,
+            twinkleOffset: Math.random() * Math.PI * 2
+        });
     }
 
     // ─── Draw ─────────────────────────────────────────────────────────────────
@@ -1407,7 +1613,7 @@
         ctx.fillStyle = '#00ff88';
         ctx.font = 'bold 40px Courier New';
         ctx.textAlign = 'center';
-        ctx.fillText('AUDIO SPECTRUM SHOOTER', canvas.width / 2, 160);
+        ctx.fillText('AMBIENT SPECTRE', canvas.width / 2, 160);
         ctx.restore();
 
         ctx.fillStyle = 'rgba(0,255,136,0.5)';
@@ -1542,6 +1748,7 @@
             player.score += 50;
             scoreFlashTimer = 40;
             createExplosionSound();
+            spawnKillStar(nearestEnemy);
             const cx = ex, cy = ey;
             const particles = [];
             for (let p = 0; p < 12; p++) {
@@ -1565,6 +1772,7 @@
             enemiesDestroyed++;
             player.score += 50;
             scoreFlashTimer = 50;
+            spawnKillStar(enemy);
             // Spawn explosion for each
             const cx = enemy.x + enemy.width / 2;
             const cy = enemy.y + enemy.height / 2;
@@ -1588,6 +1796,11 @@
         ambientClearFlash = 40;
         ambientLettersRevealed = 0;
         ambientComboTimer = 0;
+        // ── Ambience: stars flare, sky revealed, constellations drawn ──
+        constellationFlash = CONSTELLATION_DURATION;
+        // Boost all existing star brightness briefly (handled via constellationFlash in drawAmbience)
+        // Spawn a dense mote storm for the clear
+        for (let burst = 0; burst < 4; burst++) spawnMoteCluster();
     }
 
     // ─── Update ───────────────────────────────────────────────────────────────
@@ -1905,10 +2118,12 @@
                             player.score += 50;
                             scoreFlashTimer = 40;
                             createExplosionSound();
+                            spawnKillStar(enemy);
 
                             // ── AMBIENT combo ──────────────────────────────
                             ambientLettersRevealed++;
                             ambientComboTimer = AMBIENT_COMBO_WINDOW;
+                            spawnMoteCluster();  // each combo letter = traveling motes
                             if (ambientLettersRevealed >= 7) {
                                 triggerAmbientClear();
                             } else {
@@ -1980,6 +2195,7 @@
 
         ctx.fillStyle = 'rgba(13, 13, 31, 0.25)';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
+        drawAmbience();
         drawSpectrum();
         drawBoundaryLine();
         drawPellets();
@@ -2016,6 +2232,7 @@
         pelletSpawnTimer = 0; dangerZoneDamageTimer = 0; shootCooldown = 0; scoreFlashTimer = 0;
         ambientLettersRevealed = 0; ambientComboTimer = 0; ambientClearFlash = 0;
         spectrumImmersed = false; spectrumDashDir = 1; spectrumDashTimer = 0;
+        ambienceStars.length = 0; ambienceMotes.length = 0; constellationFlash = 0;
         gameState = 'playing';
         spawnEnemy();
     }
