@@ -41,6 +41,15 @@
     const canvas = document.getElementById('canvas');
     const ctx = canvas.getContext('2d');
 
+    // Global error catcher — logs full stack so we can pinpoint any crash
+    window.addEventListener('error', e => {
+        console.error('GAME CRASH:', e.message, '\nFile:', e.filename, '\nLine:', e.lineno, '\nCol:', e.colno);
+        if (e.error) console.error(e.error.stack);
+    });
+    window.addEventListener('unhandledrejection', e => {
+        console.error('UNHANDLED PROMISE:', e.reason);
+    });
+
     // ─── Audio Context ────────────────────────────────────────────────────────
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const analyser = audioCtx.createAnalyser();
@@ -286,11 +295,108 @@
     let bombs = [];        // enemy bomb projectiles
     let explosions = [];   // active bomb blast effects
     let laserBeams = [];   // AMBIENT combo laser strikes
+    let crystals = [];     // special crystal spike enemies
+    let comets = [];       // crystal-fired homing comets
     const keys = {};
     let pelletSpawnTimer = 0;
     let dangerZoneDamageTimer = 0;
     let shootCooldown = 0;
     let scoreFlashTimer = 0;  // counts down frames after score increases
+
+    // ─── Wave Controller ──────────────────────────────────────────────────────
+    // Enemies now spawn in waves shaped like a triangle wave:
+    // enemy cap rises to a peak then falls back, cycling at higher difficulty.
+    const WC = (() => {
+        // Triangle wave: maps wave index → peak enemy count for that wave
+        // Cycle length = 6 waves. Peak at mid-cycle. Baseline rises each cycle.
+        const CYCLE_LEN     = 6;   // waves per triangle cycle
+        const PEAK_ENEMIES  = 5;   // max enemies at triangle peak
+        const BASE_ENEMIES  = 1;   // min enemies at triangle trough
+        const BETWEEN_FRAMES = 120; // pause between waves (~2s)
+        const CRYSTAL_EVERY  = 3;  // spawn crystal after every Nth wave cleared
+
+        const pub = {
+            wave:         1,
+            phase:        'spawning',  // 'spawning' | 'between'
+            betweenTimer: 0,
+            waveKillGoal: 0,    // kills needed to complete current wave
+            waveKills:    0,    // kills so far this wave (enemies + crystals)
+            announceFade: 0,    // frames left on wave announcement flash
+            totalWaveClears: 0, // counts completed waves for crystal trigger
+        };
+
+        function _trianglePeak(waveNum) {
+            // Position within current cycle (0-based)
+            const pos = ((waveNum - 1) % CYCLE_LEN);
+            const cycle = Math.floor((waveNum - 1) / CYCLE_LEN);
+            const half = CYCLE_LEN / 2;
+            // Triangle 0→1→0 across the cycle
+            const t = pos < half ? pos / half : 1 - (pos - half) / half;
+            const baseline = BASE_ENEMIES + cycle;  // baseline rises each cycle
+            return Math.round(baseline + (PEAK_ENEMIES + cycle - baseline) * t);
+        }
+
+        pub.getCurrentPeak = () => _trianglePeak(pub.wave);
+
+        pub.startWave = function(waveNum) {
+            pub.wave       = waveNum;
+            pub.phase      = 'spawning';
+            pub.waveKills  = 0;
+            // Kill goal = peak × 2 so the wave has substance at peaks
+            pub.waveKillGoal = Math.max(2, _trianglePeak(waveNum) * 2);
+            pub.announceFade = 160;
+        };
+
+        // Called from update each frame
+        pub.tick = function(aliveEnemies, aliveCrystals) {
+            if (pub.phase === 'between') {
+                pub.betweenTimer--;
+                if (pub.betweenTimer <= 0) {
+                    pub.startWave(pub.wave + 1);
+                }
+                return { shouldSpawnEnemy: false, shouldSpawnCrystal: false };
+            }
+
+            if (pub.announceFade > 0) pub.announceFade--;
+
+            const peak = _trianglePeak(pub.wave);
+            // Spawn probability tapers with alive count vs peak
+            const spawnChance = aliveEnemies < peak ? 0.012 + (peak - aliveEnemies) * 0.004 : 0;
+
+            // Crystal only spawns if there isn't one already, and no normal enemies spawning right now
+            const shouldSpawnCrystal = aliveCrystals === 0 &&
+                pub.waveKills >= Math.floor(pub.waveKillGoal * 0.5) &&
+                pub.totalWaveClears > 0 &&
+                (pub.totalWaveClears % CRYSTAL_EVERY === 0) &&
+                aliveEnemies === 0 && aliveCrystals === 0 &&
+                pub._crystalSpawnedThisWave !== true;
+
+            return {
+                shouldSpawnEnemy: aliveEnemies < peak && Math.random() < spawnChance,
+                shouldSpawnCrystal
+            };
+        };
+
+        pub.registerKill = function(isCrystal) {
+            pub.waveKills++;
+            if (isCrystal) pub.waveKills += 2; // crystal counts as 3 kills
+            if (pub.waveKills >= pub.waveKillGoal) {
+                pub.phase = 'between';
+                pub.betweenTimer = BETWEEN_FRAMES;
+                pub.totalWaveClears++;
+                pub._crystalSpawnedThisWave = false;
+                return true; // wave complete
+            }
+            return false;
+        };
+
+        pub.markCrystalSpawned = function() {
+            pub._crystalSpawnedThisWave = true;
+        };
+
+        pub.startWave(1);
+        return pub;
+    })();
 
     // ─── Spectrum Immersion State ─────────────────────────────────────────────
     let spectrumImmersed = false;   // true when player is in heal zone with spectrum_heal
@@ -511,6 +617,9 @@
     function _oneShot({ freq, type = 'sine', gainPeak = 0.15, attack = 0.02,
                          decay = 0.15, filterFreq = null, filterQ = 1,
                          delayRoute = false, startOffset = 0, freqEnd = null }) {
+        // Guard: audio nodes may not be ready yet
+        if (!reverbNode || !delayNode) return null;
+        if (!isFinite(freq) || freq <= 0) return null;
         const t = audioCtx.currentTime + startOffset;
         const osc  = audioCtx.createOscillator();
         const gn   = audioCtx.createGain();
@@ -565,7 +674,7 @@
     }
 
     function createHitSound() {
-        // Pitch-mapped to scale degree 6 (minor 7th) — shifts with mode for harmonic fit
+        if (!delayNode || !analyser) return;
         const note = HD.getNote(6, 0);
         const t = audioCtx.currentTime;
 
@@ -624,8 +733,8 @@
     }
 
     function createExplosionSound() {
+        if (!delayNode || !reverbNode) return;
         const t = audioCtx.currentTime;
-        // Noise burst
         const bufSize = Math.floor(audioCtx.sampleRate * 0.55);
         const buf  = audioCtx.createBuffer(1, bufSize, audioCtx.sampleRate);
         const data = buf.getChannelData(0);
@@ -659,8 +768,8 @@
     }
 
     function createBombDetonationSound() {
+        if (!delayNode || !reverbNode) return;
         const t = audioCtx.currentTime;
-        // Deep noise boom
         const bufSize = Math.floor(audioCtx.sampleRate * 0.85);
         const buf  = audioCtx.createBuffer(1, bufSize, audioCtx.sampleRate);
         const data = buf.getChannelData(0);
@@ -727,6 +836,44 @@
         _oneShot({ freq: HD.getNote(0, -1), type: 'sine', gainPeak: 0.30,
                    attack: 0.04, decay: 0.80 });
     }
+    function createCrystalSpawnSound() {
+        // Rising crystalline shimmer — two stacked sine sweeps, cold and glassy
+        [0, 3, 5].forEach((deg, i) => {
+            const f = HD.getNote(deg, 2);
+            _oneShot({ freq: f, type: 'sine', gainPeak: 0.12, attack: 0.06 + i * 0.03,
+                       decay: 0.8 + i * 0.2, startOffset: i * 0.08 });
+        });
+        // High overtone ping
+        _oneShot({ freq: HD.getNote(0, 3), type: 'sine', gainPeak: 0.08, attack: 0.02, decay: 0.5 });
+    }
+
+    function createCrystalHitSound() {
+        // Sharp glassy crack — high sawtooth transient with fast decay
+        _oneShot({ freq: HD.getNote(2, 2), type: 'sawtooth', gainPeak: 0.22,
+                   attack: 0.003, decay: 0.12, freqEnd: HD.getNote(2, 2) * 1.6 });
+        _oneShot({ freq: HD.getNote(4, 3), type: 'sine', gainPeak: 0.09,
+                   attack: 0.003, decay: 0.08 });
+    }
+
+    function createCrystalDeathSound() {
+        // Full shattering chord cascade down — all mode degrees rapid-fire
+        [0,6,4,2,5,3,1].forEach((deg, i) => {
+            const f = HD.getNote(deg, 2 - Math.floor(i / 3));
+            _oneShot({ freq: f, type: 'sawtooth', gainPeak: 0.15, attack: 0.005,
+                       decay: 0.35, freqEnd: f * 0.4, startOffset: i * 0.04 });
+        });
+        // Deep sub thump
+        _oneShot({ freq: HD.getNote(0, 0), type: 'sine', gainPeak: 0.30,
+                   attack: 0.01, decay: 0.60 });
+    }
+
+    function createCometLaunchSound() {
+        // Whooshing upward sweep — like a stone thrown through glass
+        const f = HD.getNote(4, 1);
+        _oneShot({ freq: f * 0.5, type: 'triangle', gainPeak: 0.10, attack: 0.01,
+                   decay: 0.28, freqEnd: f * 1.4, filterFreq: 2200, filterQ: 1 });
+    }
+
     // ─── Pellets ──────────────────────────────────────────────────────────────
     // Powerup types — damage_boost is now in the pool
     const POWERUP_TYPES = ['rapid_fire', 'spread_shot', 'shield', 'spectrum_heal', 'damage_boost'];
@@ -877,7 +1024,60 @@
         createSpawnSound();
     }
 
-    // ─── Collision ────────────────────────────────────────────────────────────
+    // ─── Crystal Spike Spawn ──────────────────────────────────────────────────
+    const CRYSTAL_ATTRACT_RADIUS = 190; // same as pellet attract radius
+
+    function spawnCrystal() {
+        WC.markCrystalSpawned();
+        const x = Math.max(canvas.width * 0.55, Math.min(canvas.width - 30,
+                    canvas.width * 0.55 + Math.random() * (canvas.width * 0.35)));
+        const y = Math.max(60, Math.min(canvas.height - DANGER_ZONE_HEIGHT - 60,
+                    60 + Math.random() * (canvas.height - DANGER_ZONE_HEIGHT - 120)));
+
+        // Health scales with wave number — enough to survive a full spread volley
+        // Wave 3 → 120hp, wave 6 → 180hp, wave 9+ → 240hp
+        const waveBonus  = Math.min(6, Math.floor(WC.wave / 3)) * 40;
+        const maxHp      = 120 + waveBonus;
+
+        crystals.push({
+            x, y,
+            health:         maxHp,
+            maxHealth:      maxHp,
+            absorbedMass:   0,
+            size:           28,           // slightly larger base so it reads clearly
+            rotation:       0,
+            cometTimer:     180,          // first comet after 3s so player feels the threat
+            cometInterval:  220,
+            isAlive:        true,
+            hitFlash:       0,
+            hue:            185 + Math.random() * 30,
+        });
+        createCrystalSpawnSound();
+    }
+
+    function spawnComet(crystal) {
+        const px = player.x + player.width / 2;
+        const py = player.y + player.height / 2;
+        const dxP = px - crystal.x, dyP = py - crystal.y;
+        const baseDist = Math.sqrt(dxP*dxP + dyP*dyP) || 1;
+        const baseAngle = Math.atan2(dyP / baseDist, dxP / baseDist);
+        // Scatter ±60° from player direction
+        const scatter = (Math.random() - 0.5) * Math.PI * 0.67;
+        const angle = baseAngle + scatter;
+        const speed = 1.8 + Math.random() * 1.2;
+        comets.push({
+            x: crystal.x,
+            y: crystal.y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            homingStrength: 0.018,
+            radius: Math.max(3, 7 + crystal.absorbedMass * 0.8),
+            tail: [],   // [{x,y,alpha}] ring buffer
+            maxTail: 8,
+            hue: crystal.hue,
+            damage: 18,
+        });
+    }
     function checkCollision(r1, r2) {
         return r1.x < r2.x + r2.width && r1.x + r1.width > r2.x &&
                r1.y < r2.y + r2.height && r1.y + r1.height > r2.y;
@@ -904,7 +1104,7 @@
             ctx.save();
             ctx.globalAlpha = alpha;
             // Outer glow
-            const grad = ctx.createRadialGradient(star.x, star.y, 0, star.x, star.y, radius * 4);
+            const grad = ctx.createRadialGradient(star.x, star.y, 0, star.x, star.y, Math.max(1, radius * 4));
             grad.addColorStop(0, star.color);
             grad.addColorStop(1, 'rgba(0,0,0,0)');
             ctx.fillStyle = grad;
@@ -1059,10 +1259,12 @@
     }
 
     function spawnKillStar(enemy) {
-        // Place a small star near the enemy's last known position, avoiding HUD areas
-        const sx = enemy.x + enemy.width / 2 + (Math.random() - 0.5) * 40;
+        // Works for both enemy ships (have width/height) and crystals (have size)
+        const halfW = (enemy.width  != null) ? enemy.width  / 2 : (enemy.size || 20);
+        const halfH = (enemy.height != null) ? enemy.height / 2 : (enemy.size || 20);
+        const sx = enemy.x + halfW + (Math.random() - 0.5) * 40;
         const sy = Math.max(55, Math.min(canvas.height - 140,
-            enemy.y + enemy.height / 2 + (Math.random() - 0.5) * 40));
+            enemy.y + halfH + (Math.random() - 0.5) * 40));
         const hue = 180 + Math.random() * 80; // cool blues/cyans/teals
         ambienceStars.push({
             x: sx,
@@ -1651,7 +1853,7 @@
             ctx.stroke();
 
             // Inner fireball
-            const fireR = ex.blastRadius * 0.55 * (1 - pct * 0.7);
+            const fireR = Math.max(1, ex.blastRadius * 0.55 * (1 - pct * 0.7));
             const fireGrad = ctx.createRadialGradient(ex.x, ex.y, 0, ex.x, ex.y, fireR);
             fireGrad.addColorStop(0, `rgba(255,255,200,${(1 - pct) * 0.9})`);
             fireGrad.addColorStop(0.4, `rgba(255,120,0,${(1 - pct) * 0.7})`);
@@ -1749,6 +1951,221 @@
         }
     }
 
+    // ─── Crystal Spike Drawing ────────────────────────────────────────────────
+    function drawCrystals() {
+        const now = Date.now();
+        crystals.forEach(crystal => {
+            if (!crystal.isAlive) return;
+
+            // Clamp position to safe finite values
+            const cx = isFinite(crystal.x) ? crystal.x : canvas.width * 0.7;
+            const cy = isFinite(crystal.y) ? crystal.y : canvas.height * 0.4;
+
+            // s = visual arm half-length, hard-capped
+            const s       = Math.max(8, Math.min(60, crystal.size));
+            const hue     = isFinite(crystal.hue) ? crystal.hue : 195;
+            const hitPulse = (crystal.hitFlash > 0) ? Math.min(1, crystal.hitFlash / 12) : 0;
+            const rot     = isFinite(crystal.rotation) ? crystal.rotation : 0;
+
+            try {
+                ctx.save();
+
+                // Aura drawn in world space before translate, so gradient coords are simple screen coords
+                const auraR  = 88;
+                const auraIn = Math.min(s * 0.4, auraR * 0.78);
+                const auraA  = 0.05 + 0.03 * Math.sin(now / 700);
+                const ag = ctx.createRadialGradient(cx, cy, auraIn, cx, cy, auraR);
+                ag.addColorStop(0,   `hsla(${hue},85%,72%,${+(auraA*2).toFixed(3)})`);
+                ag.addColorStop(0.6, `hsla(${hue},75%,52%,${+auraA.toFixed(3)})`);
+                ag.addColorStop(1,   `hsla(${hue},65%,38%,0)`);
+                ctx.fillStyle = ag;
+                ctx.beginPath();
+                ctx.arc(cx, cy, auraR, 0, Math.PI * 2);
+                ctx.fill();
+
+                // Now translate for prism geometry
+                ctx.translate(cx, cy);
+                ctx.rotate(rot);
+
+                const w = s * 0.30;
+                const h = s;
+
+                for (let arm = 0; arm < 2; arm++) {
+                    ctx.save();
+                    ctx.rotate(arm * Math.PI / 2);
+
+                    ctx.shadowBlur = 0;
+                    const pg = ctx.createLinearGradient(-w, 0, w, 0);
+                    pg.addColorStop(0,    `hsla(${hue},60%,50%,0.80)`);
+                    pg.addColorStop(0.35, `hsla(${hue},78%,76%,0.92)`);
+                    pg.addColorStop(0.5,  `hsla(${hue+15},100%,96%,0.98)`);
+                    pg.addColorStop(0.65, `hsla(${hue},78%,76%,0.92)`);
+                    pg.addColorStop(1,    `hsla(${hue},60%,50%,0.80)`);
+                    ctx.beginPath();
+                    ctx.moveTo(0,-h); ctx.lineTo(w,0); ctx.lineTo(0,h); ctx.lineTo(-w,0);
+                    ctx.closePath();
+                    ctx.fillStyle = pg;
+                    ctx.fill();
+
+                    ctx.strokeStyle = `hsla(${hue},50%,42%,0.38)`;
+                    ctx.lineWidth = 0.8;
+                    ctx.beginPath();
+                    ctx.moveTo(0,-h*0.5); ctx.lineTo(-w*0.88,0); ctx.lineTo(0,h*0.5);
+                    ctx.stroke();
+                    ctx.beginPath();
+                    ctx.moveTo(0,-h*0.5); ctx.lineTo(w*0.88,0); ctx.lineTo(0,h*0.5);
+                    ctx.stroke();
+
+                    ctx.shadowColor = `hsl(${hue+20},100%,90%)`;
+                    ctx.shadowBlur  = 5 + hitPulse * 8;
+                    ctx.strokeStyle = `hsla(${hue+20},100%,96%,${+(0.72+hitPulse*0.28).toFixed(3)})`;
+                    ctx.lineWidth   = 1.1 + hitPulse * 0.7;
+                    ctx.beginPath();
+                    ctx.moveTo(0,-h*0.82); ctx.lineTo(0,h*0.82);
+                    ctx.stroke();
+
+                    ctx.shadowBlur = 3;
+                    ctx.fillStyle  = `hsla(${hue+10},100%,95%,${+(0.55+hitPulse*0.45).toFixed(3)})`;
+                    ctx.beginPath(); ctx.arc(0,-h*0.93,1.6,0,Math.PI*2); ctx.fill();
+                    ctx.beginPath(); ctx.arc(0, h*0.93,1.6,0,Math.PI*2); ctx.fill();
+                    ctx.shadowBlur = 0;
+                    ctx.restore();
+                }
+
+                const coreR = Math.max(2.5, s * 0.16 + hitPulse * s * 0.07);
+                const pulse = 0.72 + 0.28 * Math.sin(now / 190);
+                ctx.shadowColor = '#fff';
+                ctx.shadowBlur  = 7 + hitPulse * 10;
+                const cg2 = ctx.createRadialGradient(0, 0, 0, 0, 0, coreR);
+                cg2.addColorStop(0,    `rgba(255,255,255,${+(0.95*pulse).toFixed(3)})`);
+                cg2.addColorStop(0.45, `hsla(${hue},100%,82%,${+(0.78*pulse).toFixed(3)})`);
+                cg2.addColorStop(1,    `hsla(${hue},78%,52%,0)`);
+                ctx.fillStyle = cg2;
+                ctx.beginPath(); ctx.arc(0,0,coreR,0,Math.PI*2); ctx.fill();
+                ctx.shadowBlur = 0;
+
+                // Health bar — segmented, shows health/maxHealth
+                const barW  = Math.max(40, s * 2.2);
+                const barH  = 5;
+                const barX  = -barW / 2;
+                const barY  = -(s + 16);
+                const hpPct = Math.max(0, (crystal.health || 0) / (crystal.maxHealth || 1));
+
+                // Track (background)
+                ctx.fillStyle = 'rgba(30,30,50,0.70)';
+                ctx.beginPath();
+                ctx.roundRect(barX, barY, barW, barH, 2);
+                ctx.fill();
+
+                // Fill — colour shifts red as health drops
+                const barHue = hpPct > 0.5 ? hue : hpPct > 0.25 ? 40 : 0;
+                const barSat = hpPct > 0.5 ? 85 : 90;
+                ctx.fillStyle = `hsla(${barHue},${barSat}%,65%,0.90)`;
+                ctx.beginPath();
+                ctx.roundRect(barX, barY, barW * hpPct, barH, 2);
+                ctx.fill();
+
+                // Border
+                ctx.strokeStyle = `hsla(${hue},60%,60%,0.50)`;
+                ctx.lineWidth = 0.8;
+                ctx.beginPath();
+                ctx.roundRect(barX, barY, barW, barH, 2);
+                ctx.stroke();
+
+                ctx.restore();
+            } catch(e) {
+                console.warn('drawCrystals err:', e.message, {cx, cy, s, hue, rot});
+                try { ctx.restore(); } catch(_) {}
+            }
+
+            crystal.rotation = (crystal.rotation + 0.003 + crystal.absorbedMass * 0.0005) % (Math.PI * 2);
+            if (crystal.hitFlash > 0) crystal.hitFlash--;
+        });
+    }
+
+
+    // ─── Comet Drawing ────────────────────────────────────────────────────────
+    function drawComets() {
+        comets.forEach(comet => {
+            if (!isFinite(comet.x) || !isFinite(comet.y)) return;
+            const safeR = Math.max(1, comet.radius);
+
+            ctx.save();
+
+            // Draw tail first (oldest → newest, back to front)
+            comet.tail.forEach((pt, ti) => {
+                if (!isFinite(pt.x) || !isFinite(pt.y)) return;
+                const a = (ti / comet.tail.length) * 0.45;
+                const r = Math.max(0.5, safeR * (ti / comet.tail.length) * 0.7);
+                ctx.globalAlpha = a;
+                ctx.fillStyle = `hsl(${comet.hue}, 80%, 70%)`;
+                ctx.shadowColor = `hsl(${comet.hue}, 90%, 80%)`;
+                ctx.shadowBlur = 4;
+                ctx.beginPath();
+                ctx.arc(pt.x, pt.y, r, 0, Math.PI * 2);
+                ctx.fill();
+            });
+
+            // Comet head — glowing sphere with bright core
+            ctx.globalAlpha = 1;
+            const headGrad = ctx.createRadialGradient(comet.x, comet.y, 0, comet.x, comet.y, safeR * 1.6);
+            headGrad.addColorStop(0,   'rgba(255,255,255,0.95)');
+            headGrad.addColorStop(0.3, `hsla(${comet.hue}, 100%, 80%, 0.85)`);
+            headGrad.addColorStop(0.7, `hsla(${comet.hue}, 80%, 55%, 0.5)`);
+            headGrad.addColorStop(1,   `hsla(${comet.hue}, 70%, 40%, 0)`);
+            ctx.fillStyle = headGrad;
+            ctx.shadowColor = `hsl(${comet.hue}, 100%, 75%)`;
+            ctx.shadowBlur = 12;
+            ctx.beginPath();
+            ctx.arc(comet.x, comet.y, safeR * 1.4, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.shadowBlur = 0;
+            ctx.restore();
+        });
+    }
+
+    // ─── Wave Announcement Drawing ─────────────────────────────────────────────
+    function drawWaveAnnouncement() {
+        if (WC.announceFade <= 0) return;
+        ctx.save();
+        const pct  = WC.announceFade / 160;
+        // Fade in on first 20%, hold, fade out on last 30%
+        const alpha = pct < 0.2 ? pct / 0.2 : pct > 0.7 ? (pct - 0.7) / 0.3 * 0.0 + (1 - (pct - 0.7) / 0.3) : 1.0;
+
+        // "BETWEEN" screen — wave cleared pause
+        if (WC.phase === 'between') {
+            ctx.globalAlpha = Math.min(1, alpha * 0.85);
+            ctx.fillStyle = 'rgba(0,0,0,0.3)';
+            ctx.fillRect(canvas.width / 2 - 150, canvas.height / 2 - 40, 300, 72);
+
+            ctx.textAlign = 'center';
+            ctx.shadowColor = '#88ccff';
+            ctx.shadowBlur = 18;
+            ctx.fillStyle = '#cceeff';
+            ctx.font = 'bold 13px Courier New';
+            ctx.fillText('WAVE CLEARED', canvas.width / 2, canvas.height / 2 - 10);
+            ctx.font = 'bold 11px Courier New';
+            ctx.fillStyle = 'rgba(180,210,255,0.75)';
+            ctx.fillText(`NEXT: WAVE ${WC.wave + 1}  ·  TARGET ${WC.waveKillGoal} KILLS`, canvas.width / 2, canvas.height / 2 + 14);
+        } else {
+            // New wave incoming
+            ctx.globalAlpha = Math.min(1, alpha);
+            ctx.textAlign = 'center';
+            ctx.shadowColor = '#00ffaa';
+            ctx.shadowBlur = 22;
+            ctx.fillStyle = '#88ffcc';
+            ctx.font = `bold ${Math.round(22 + (1 - pct) * 8)}px Courier New`;
+            ctx.fillText(`WAVE  ${WC.wave}`, canvas.width / 2, canvas.height / 2 - 10);
+            const peak = WC.getCurrentPeak();
+            ctx.font = 'bold 11px Courier New';
+            ctx.fillStyle = 'rgba(140,255,200,0.7)';
+            ctx.fillText(`MAX ENEMIES  ${peak}  ·  KILLS REQUIRED  ${WC.waveKillGoal}`, canvas.width / 2, canvas.height / 2 + 14);
+        }
+        ctx.shadowBlur = 0;
+        ctx.restore();
+    }
+
     function drawHUD() {
         ctx.save();
         ctx.font = 'bold 13px Courier New';
@@ -1808,10 +2225,21 @@
         ctx.font = 'bold 13px Courier New';
         ctx.textAlign = 'left';
 
-        // Enemies alive
-        const alive = enemies.filter(e => e.isAlive).length;
+        // Wave + enemies display
+        const alive = enemies.filter(e => e.isAlive).length + crystals.filter(c => c.isAlive).length;
         ctx.fillStyle = '#ff6666';
         ctx.fillText(`ENEMIES  ${alive}`, 380, 20);
+        // Wave progress bar — thin line under enemies count
+        ctx.fillStyle = 'rgba(100,200,255,0.25)';
+        ctx.fillRect(380, 24, 120, 3);
+        const wavePct = Math.min(1, WC.waveKills / WC.waveKillGoal);
+        ctx.fillStyle = WC.phase === 'between' ? 'rgba(100,255,180,0.7)' : 'rgba(100,200,255,0.65)';
+        ctx.fillRect(380, 24, 120 * wavePct, 3);
+        // Wave number small label
+        ctx.fillStyle = 'rgba(140,220,255,0.7)';
+        ctx.font = '9px Courier New';
+        ctx.textAlign = 'left';
+        ctx.fillText(`W${WC.wave}`, 504, 22);
 
         // Pellets until powerup counter
         const pUntil = pelletsUntilNextPowerup();
@@ -2024,7 +2452,7 @@
 
     // ─── AMBIENT Laser Strike ─────────────────────────────────────────────────
     function fireAmbientLaser(letterIndex) {
-        // Find the nearest alive enemy to the player
+        // Find the nearest alive target — enemy or crystal
         const px = player.x + player.width / 2;
         const py = player.y + player.height / 2;
         let nearestEnemy = null;
@@ -2034,50 +2462,68 @@
             const ex = enemy.x + enemy.width / 2;
             const ey = enemy.y + enemy.height / 2;
             const d = Math.sqrt((ex - px) * (ex - px) + (ey - py) * (ey - py));
-            if (d < nearestDist) { nearestDist = d; nearestEnemy = enemy; }
+            if (d < nearestDist) { nearestDist = d; nearestEnemy = { obj: enemy, x: ex, y: ey, isCrystal: false }; }
+        });
+        crystals.forEach(crys => {
+            if (!crys.isAlive) return;
+            const d = Math.sqrt((crys.x - px) ** 2 + (crys.y - py) ** 2);
+            if (d < nearestDist) { nearestDist = d; nearestEnemy = { obj: crys, x: crys.x, y: crys.y, isCrystal: true }; }
         });
         if (!nearestEnemy) return;
 
-        const ex = nearestEnemy.x + nearestEnemy.width / 2;
-        const ey = nearestEnemy.y + nearestEnemy.height / 2;
+        const { x: ex, y: ey, obj, isCrystal } = nearestEnemy;
 
-        // Deal damage — scales with combo depth so later letters hit harder
+        // Deal damage
         const damage = 25 + letterIndex * 8;
-        nearestEnemy.health -= damage;
+        if (isCrystal) {
+            obj.health -= damage;
+            obj.hitFlash = 12;
+        } else {
+            obj.health -= damage;
+        }
 
-        // Laser beam visual: from player nose to enemy center
+        // Laser beam visual
         laserBeams.push({
-            x1: px + player.width / 2,  // player nose tip
+            x1: px + player.width / 2,
             y1: py,
-            x2: ex,
-            y2: ey,
-            life: 22,        // frames alive
-            maxLife: 22,
-            letterIndex,     // 0-6, affects color hue
-            targetEnemy: nearestEnemy
+            x2: ex, y2: ey,
+            life: 22, maxLife: 22,
+            letterIndex,
+            targetEnemy: obj
         });
-
         createAmbientLaserSound(letterIndex);
 
-        // If kill triggered a combo (health <= 0), handle it here so explosion fires
-        if (nearestEnemy.health <= 0) {
-            nearestEnemy.isAlive = false;
-            enemiesDestroyed++;
-            player.score += 50;
-            scoreFlashTimer = 40;
-            createExplosionSound();
-            spawnKillStar(nearestEnemy);
-            const cx = ex, cy = ey;
-            const particles = [];
-            for (let p = 0; p < 12; p++) {
-                const a = Math.random() * Math.PI * 2, s = 1.5 + Math.random() * 3.5;
-                particles.push({ x: cx, y: cy, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 0.5, r: 2 + Math.random() * 3 });
+        // Kill handling
+        const isDead = isCrystal ? obj.health <= 0 : obj.health <= 0;
+        if (isDead) {
+            if (isCrystal) {
+                obj.isAlive = false;
+                enemiesDestroyed++;
+                player.score += 150;
+                scoreFlashTimer = 50;
+                createCrystalDeathSound();
+                spawnKillStar(obj);
+                WC.registerKill(true);
+                explosions.push({ x: ex, y: ey, blastRadius: 70, frame: 0, duration: 50, particles: [] });
+            } else {
+                obj.isAlive = false;
+                enemiesDestroyed++;
+                player.score += 50;
+                scoreFlashTimer = 40;
+                createExplosionSound();
+                spawnKillStar(obj);
+                WC.registerKill(false);
+                const particles = [];
+                for (let p = 0; p < 12; p++) {
+                    const a = Math.random() * Math.PI * 2, s = 1.5 + Math.random() * 3.5;
+                    particles.push({ x: ex, y: ey, vx: Math.cos(a)*s, vy: Math.sin(a)*s - 0.5, r: 2 + Math.random() * 3 });
+                }
+                explosions.push({ x: ex, y: ey, blastRadius: 55, frame: 0, duration: 40, particles });
+                setTimeout(() => {
+                    const idx = enemies.indexOf(obj);
+                    if (idx > -1) enemies.splice(idx, 1);
+                }, 500);
             }
-            explosions.push({ x: cx, y: cy, blastRadius: 55, frame: 0, duration: 40, particles });
-            setTimeout(() => {
-                const idx = enemies.indexOf(nearestEnemy);
-                if (idx > -1) enemies.splice(idx, 1);
-            }, 500);
         }
     }
 
@@ -2091,6 +2537,7 @@
             player.score += 50;
             scoreFlashTimer = 50;
             spawnKillStar(enemy);
+            WC.registerKill(false);
             // Spawn explosion for each
             const cx = enemy.x + enemy.width / 2;
             const cy = enemy.y + enemy.height / 2;
@@ -2106,9 +2553,19 @@
                 if (idx > -1) enemies.splice(idx, 1);
             }, 500);
         });
-        // Also clear all enemy bullets and bombs
+        // Also destroy crystals in an ambient clear
+        crystals.forEach(crys => {
+            if (!crys.isAlive) return;
+            crys.isAlive = false;
+            player.score += 150;
+            spawnKillStar(crys);
+            WC.registerKill(true);
+            explosions.push({ x: crys.x, y: crys.y, blastRadius: 70, frame: 0, duration: 50, particles: [] });
+        });
+        // Also clear all enemy bullets, bombs, comets
         bullets = bullets.filter(b => b.owner !== 'enemy');
         bombs.length = 0;
+        comets.length = 0;
 
         createAmbientClearSound();
         ambientClearFlash = 40;
@@ -2116,7 +2573,6 @@
         ambientComboTimer = 0;
         // ── Ambience: stars flare, sky revealed, constellations drawn ──
         constellationFlash = CONSTELLATION_DURATION;
-        // Boost all existing star brightness briefly (handled via constellationFlash in drawAmbience)
         // Spawn a dense mote storm for the clear
         for (let burst = 0; burst < 4; burst++) spawnMoteCluster();
     }
@@ -2154,10 +2610,146 @@
             if (player.powerups[i].timer <= 0) player.powerups.splice(i, 1);
         }
 
-        // Enemy scaling — higher cap, quicker ramp
-        maxEnemies = Math.min(2 + Math.floor(enemiesDestroyed / 2), 8);
-        const aliveEnemies = enemies.filter(e => e.isAlive).length;
-        if (aliveEnemies < maxEnemies && Math.random() < 0.015) spawnEnemy();
+        // ── Wave Controller tick ──────────────────────────────────────────────
+        const aliveEnemies  = enemies.filter(e => e.isAlive).length;
+        const aliveCrystals = crystals.filter(c => c.isAlive).length;
+        const wcResult = WC.tick(aliveEnemies, aliveCrystals);
+
+        if (wcResult.shouldSpawnEnemy)   spawnEnemy();
+        if (wcResult.shouldSpawnCrystal) spawnCrystal();
+
+        // ── Crystal update — attraction field + comet firing ─────────────────
+        const pcx = player.x + player.width / 2;
+        const pcy = player.y + player.height / 2;
+
+        for (let ci = crystals.length - 1; ci >= 0; ci--) {
+            const crys = crystals[ci];
+            if (!crys.isAlive) { crystals.splice(ci, 1); continue; }
+
+            // ── Attraction: pull bullets, bombs, pellets toward crystal ──
+            const cx = crys.x, cy = crys.y;
+
+            // Pull player bullets (consumes them — feeds the crystal)
+            for (let bi = bullets.length - 1; bi >= 0; bi--) {
+                const b = bullets[bi];
+                if (b.owner !== 'player') continue;
+                const dx = cx - b.x, dy = cy - b.y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                // Only attract if outside hit range — inside, let bullet collision handle it
+                if (dist < CRYSTAL_ATTRACT_RADIUS && dist > crys.size * 0.85) {
+                    const str = 0.9 * (1 - dist / CRYSTAL_ATTRACT_RADIUS);
+                    b.vx += (dx / dist) * str;
+                    b.vy += (dy / dist) * str;
+                }
+                // Absorb stray bullets that reach the very core (slipped past hit check)
+                if (dist < crys.size * 0.35) {
+                    bullets.splice(bi, 1);
+                    crys.absorbedMass++;
+                    crys.health = Math.min(crys.maxHealth, crys.health + 8);
+                    crys.size = Math.min(72, 28 + crys.absorbedMass * 1.8);
+                    crys.cometInterval = Math.max(75, 220 - crys.absorbedMass * 10);
+                }
+            }
+
+            // Pull enemy bullets (deflect, not consume — just redirect)
+            bullets.forEach(b => {
+                if (b.owner !== 'enemy') return;
+                const dx = cx - b.x, dy = cy - b.y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                if (dist < CRYSTAL_ATTRACT_RADIUS * 0.7 && dist > 1) {
+                    const str = 0.5 * (1 - dist / (CRYSTAL_ATTRACT_RADIUS * 0.7));
+                    b.vx += (dx / dist) * str;
+                    b.vy += (dy / dist) * str;
+                }
+            });
+
+            // Pull bombs
+            bombs.forEach(bomb => {
+                if (bomb.phase !== 'flying') return;
+                const dx = cx - bomb.x, dy = cy - bomb.y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                if (dist < CRYSTAL_ATTRACT_RADIUS && dist > 1) {
+                    const str = 0.6 * (1 - dist / CRYSTAL_ATTRACT_RADIUS);
+                    bomb.vx += (dx / dist) * str;
+                    bomb.vy += (dy / dist) * str;
+                    // Absorbed bomb — big mass gain
+                    if (dist < crys.size + 12) {
+                        const idx = bombs.indexOf(bomb);
+                        if (idx > -1) bombs.splice(idx, 1);
+                        crys.absorbedMass += 3;
+                        crys.health = Math.min(crys.maxHealth, crys.health + 30);
+                        crys.size = Math.min(72, 28 + crys.absorbedMass * 1.8);
+                        crys.cometInterval = Math.max(75, 220 - crys.absorbedMass * 10);
+                    }
+                }
+            });
+
+            // Pull pellets
+            for (let pi = pellets.length - 1; pi >= 0; pi--) {
+                const p = pellets[pi];
+                const dx = cx - p.x, dy = cy - p.y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                if (dist < CRYSTAL_ATTRACT_RADIUS && dist > 1) {
+                    const str = 1.2 * (1 - dist / CRYSTAL_ATTRACT_RADIUS);
+                    p.x += (dx / dist) * str;
+                    p.y += (dy / dist) * str;
+                    if (dist < crys.size + 8) {
+                        pellets.splice(pi, 1);
+                        crys.absorbedMass++;
+                        crys.health = Math.min(crys.maxHealth, crys.health + 12);
+                        crys.size = Math.min(72, 28 + crys.absorbedMass * 1.8);
+                        crys.cometInterval = Math.max(75, 220 - crys.absorbedMass * 10);
+                    }
+                }
+            }
+
+            // ── Comet firing ──
+            crys.cometTimer++;
+            if (crys.cometTimer >= crys.cometInterval) {
+                spawnComet(crys);
+                createCometLaunchSound();
+                crys.cometTimer = 0;
+            }
+        }
+
+        // ── Comet update — move, home, tail, collide with player ────────────
+        for (let ci = comets.length - 1; ci >= 0; ci--) {
+            const comet = comets[ci];
+
+            // Push tail point
+            comet.tail.push({ x: comet.x, y: comet.y });
+            if (comet.tail.length > comet.maxTail) comet.tail.shift();
+
+            // Homing toward player
+            const dx = pcx - comet.x, dy = pcy - comet.y;
+            const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+            comet.vx += (dx / dist) * comet.homingStrength;
+            comet.vy += (dy / dist) * comet.homingStrength;
+            // Cap speed
+            const spd = Math.sqrt(comet.vx*comet.vx + comet.vy*comet.vy);
+            if (spd > 4.5) { comet.vx = (comet.vx/spd)*4.5; comet.vy = (comet.vy/spd)*4.5; }
+
+            comet.x += comet.vx;
+            comet.y += comet.vy;
+
+            // Out of bounds
+            if (comet.x < -20 || comet.x > canvas.width + 20 ||
+                comet.y < -20 || comet.y > canvas.height + 20) {
+                comets.splice(ci, 1); continue;
+            }
+
+            // Hit player
+            const dxP = comet.x - pcx, dyP = comet.y - pcy;
+            if (Math.sqrt(dxP*dxP + dyP*dyP) < comet.radius + 14) {
+                comets.splice(ci, 1);
+                if (spectrumImmersed) continue;
+                const dmg = hasPowerup('shield')
+                    ? (Math.random() > 0.4 ? comet.damage : 0)
+                    : comet.damage;
+                if (dmg > 0) { player.health -= dmg; createHitSound(); }
+                continue;
+            }
+        }
 
         // Enemy AI
         enemies.forEach(enemy => {
@@ -2196,10 +2788,8 @@
             spawnPellet();
             pelletSpawnTimer = 0;
         }
-        // Pellet pulse + combo attraction
+        // Pellet pulse + combo attraction (pcx/pcy defined above in crystal section)
         const hasActiveCombo = player.powerups.length > 0;
-        const pcx = player.x + player.width / 2;
-        const pcy = player.y + player.height / 2;
         const ATTRACT_RADIUS = 190;
         const ATTRACT_SPEED  = 2.8;
         pellets.forEach(p => {
@@ -2360,13 +2950,19 @@
                     if (d < 220 && d < homingDist) { homingDist = d; homingTarget = { x: bomb.x, y: bomb.y }; }
                 }
 
-                // Fallback: nearest enemy ship
+                // Fallback: nearest enemy ship or crystal
                 if (!homingTarget) {
                     enemies.forEach(enemy => {
                         if (!enemy.isAlive) return;
                         const dx = enemy.x + enemy.width / 2 - bullet.x, dy = enemy.y + enemy.height / 2 - bullet.y;
                         const d = Math.sqrt(dx * dx + dy * dy);
                         if (d < homingDist) { homingDist = d; homingTarget = { x: enemy.x + enemy.width / 2, y: enemy.y + enemy.height / 2 }; }
+                    });
+                    crystals.forEach(crys => {
+                        if (!crys.isAlive) return;
+                        const dx = crys.x - bullet.x, dy = crys.y - bullet.y;
+                        const d = Math.sqrt(dx * dx + dy * dy);
+                        if (d < homingDist) { homingDist = d; homingTarget = { x: crys.x, y: crys.y }; }
                     });
                 }
 
@@ -2446,6 +3042,7 @@
                             scoreFlashTimer = 40;
                             createExplosionSound();
                             spawnKillStar(enemy);
+                            WC.registerKill(false);
 
                             // ── AMBIENT combo ──────────────────────────────
                             ambientLettersRevealed++;
@@ -2462,6 +3059,63 @@
                                 const idx = enemies.indexOf(enemy);
                                 if (idx > -1) enemies.splice(idx, 1);
                             }, 500);
+                        }
+                        hit = true;
+                        break;
+                    }
+                }
+                if (hit) continue;
+
+                // Hit crystal spikes — circle collision using true visual size
+                for (let j = 0; j < crystals.length; j++) {
+                    const crys = crystals[j];
+                    if (!crys.isAlive) continue;
+                    const bCx = bullet.x + (bullet.width  || 0) / 2;
+                    const bCy = bullet.y + (bullet.height || 0) / 2;
+                    const dx = crys.x - bCx;
+                    const dy = crys.y - bCy;
+                    // Hit radius = visual arm length (crystal.size), generous so it's hittable
+                    if (Math.sqrt(dx*dx + dy*dy) < crys.size * 0.85) {
+                        bulletsToRemove.add(i);
+                        const dmg = bullet.damage || 10;
+                        crys.health -= dmg;
+                        crys.hitFlash = 14;
+                        createCrystalHitSound();
+                        if (crys.health <= 0) {
+                            crys.isAlive = false;
+                            enemiesDestroyed++;
+                            player.score += 150;
+                            scoreFlashTimer = 50;
+                            createCrystalDeathSound();
+                            spawnKillStar(crys);
+                            WC.registerKill(true);
+                            // Crystal death explosion
+                            const particles = [];
+                            for (let p = 0; p < 20; p++) {
+                                const a = Math.random() * Math.PI * 2;
+                                const s = 1.5 + Math.random() * 4;
+                                particles.push({ x: crys.x, y: crys.y,
+                                    vx: Math.cos(a)*s, vy: Math.sin(a)*s - 0.5,
+                                    r: 2 + Math.random() * 4 });
+                            }
+                            explosions.push({ x: crys.x, y: crys.y, blastRadius: 70,
+                                frame: 0, duration: 50, particles });
+                            // Drop pellets
+                            for (let p = 0; p < 3; p++) {
+                                const ang = (p / 3) * Math.PI * 2;
+                                pellets.push({
+                                    x: crys.x + Math.cos(ang) * 30,
+                                    y: crys.y + Math.sin(ang) * 30,
+                                    radius: 8,
+                                    color: `hsl(${crys.hue}, 90%, 65%)`,
+                                    pulse: Math.random() * Math.PI * 2
+                                });
+                            }
+                            // Ambience — crystal kill also advances combo
+                            ambientLettersRevealed = Math.min(6, ambientLettersRevealed + 2);
+                            ambientComboTimer = AMBIENT_COMBO_WINDOW;
+                            spawnMoteCluster();
+                            spawnMoteCluster();
                         }
                         hit = true;
                         break;
@@ -2528,12 +3182,15 @@
         drawPellets();
         drawPlayer();
         drawEnemies();
+        drawCrystals();
         drawBullets();
         drawBombs();
         drawExplosions();
         drawLaserBeams();
+        drawComets();
         drawHUD();
         drawAmbientLetters();
+        drawWaveAnnouncement();
         drawControls();
 
         // Shooting
@@ -2555,12 +3212,16 @@
         player.powerups = []; player.lastPowerupScore = 0;
         enemies.length = 0; bullets.length = 0; pellets.length = 0;
         bombs.length = 0; explosions.length = 0; laserBeams.length = 0;
+        crystals.length = 0; comets.length = 0;
         enemiesDestroyed = 0; maxEnemies = 1;
         pelletSpawnTimer = 0; dangerZoneDamageTimer = 0; shootCooldown = 0; scoreFlashTimer = 0;
         ambientLettersRevealed = 0; ambientComboTimer = 0; ambientClearFlash = 0;
         spectrumImmersed = false; spectrumDashDir = 1; spectrumDashTimer = 0;
         ambienceStars.length = 0; ambienceMotes.length = 0; constellationFlash = 0;
-        _lastDroneMode = null; // force drone retune on next tick
+        _lastDroneMode = null;
+        WC.startWave(1);
+        WC.totalWaveClears = 0;
+        WC._crystalSpawnedThisWave = false;
         gameState = 'playing';
         spawnEnemy();
     }
