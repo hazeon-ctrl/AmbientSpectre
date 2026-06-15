@@ -283,8 +283,9 @@
         health: 100,
         color: '#00ff88',
         score: 0,
-        lastPowerupScore: 0, // track when next powerup fires
-        powerups: []
+        lastPowerupScore: 0,
+        powerups: [],
+        crystalShieldReduction: 1.0,  // 0.95 after first crystal defeat — permanent 5% DR
     };
 
     let enemies = [];
@@ -350,7 +351,9 @@
         // Called from update each frame
         pub.tick = function(aliveEnemies, aliveCrystals) {
             if (pub.phase === 'between') {
-                pub.betweenTimer--;
+                // Don't count down the between-wave pause while a crystal is alive —
+                // the crystal encounter IS the wave event; next wave starts after it falls
+                if (aliveCrystals === 0) pub.betweenTimer--;
                 if (pub.betweenTimer <= 0) {
                     pub.startWave(pub.wave + 1);
                 }
@@ -360,19 +363,20 @@
             if (pub.announceFade > 0) pub.announceFade--;
 
             const peak = _trianglePeak(pub.wave);
-            // Spawn probability tapers with alive count vs peak
             const spawnChance = aliveEnemies < peak ? 0.012 + (peak - aliveEnemies) * 0.004 : 0;
 
-            // Crystal only spawns if there isn't one already, and no normal enemies spawning right now
-            const shouldSpawnCrystal = aliveCrystals === 0 &&
+            // Suspend all normal enemy spawns while a crystal is present
+            const crystalActive = aliveCrystals > 0;
+
+            const shouldSpawnCrystal = !crystalActive &&
                 pub.waveKills >= Math.floor(pub.waveKillGoal * 0.5) &&
                 pub.totalWaveClears > 0 &&
                 (pub.totalWaveClears % CRYSTAL_EVERY === 0) &&
-                aliveEnemies === 0 && aliveCrystals === 0 &&
+                aliveEnemies === 0 &&
                 pub._crystalSpawnedThisWave !== true;
 
             return {
-                shouldSpawnEnemy: aliveEnemies < peak && Math.random() < spawnChance,
+                shouldSpawnEnemy: !crystalActive && aliveEnemies < peak && Math.random() < spawnChance,
                 shouldSpawnCrystal
             };
         };
@@ -1034,10 +1038,10 @@
         const y = Math.max(60, Math.min(canvas.height - DANGER_ZONE_HEIGHT - 60,
                     60 + Math.random() * (canvas.height - DANGER_ZONE_HEIGHT - 120)));
 
-        // Health scales with wave number — enough to survive a full spread volley
-        // Wave 3 → 120hp, wave 6 → 180hp, wave 9+ → 240hp
-        const waveBonus  = Math.min(6, Math.floor(WC.wave / 3)) * 40;
-        const maxHp      = 120 + waveBonus;
+        // Health scales with wave — enough to require sustained focus
+        // Wave 3 → 300hp, wave 6 → 380hp, wave 9+ → 460hp
+        const waveBonus = Math.min(6, Math.floor(WC.wave / 3)) * 80;
+        const maxHp     = 300 + waveBonus;
 
         crystals.push({
             x, y,
@@ -1451,7 +1455,6 @@
         if (hasPowerup('shield')) {
             const shieldLevel = getPowerupLevel('shield');
             const alpha = 0.45 + shieldLevel * 0.15;
-            // Hexagonal shield outline for style
             ctx.strokeStyle = `rgba(0, 220, 255, ${alpha})`;
             ctx.lineWidth = 2 + shieldLevel;
             ctx.shadowColor = '#00ddff';
@@ -1466,6 +1469,29 @@
             ctx.closePath();
             ctx.stroke();
             ctx.shadowBlur = 0;
+        }
+
+        // ── Crystal DR ring — permanent after defeating the Crystal boss ──
+        if (player.crystalShieldReduction < 1.0) {
+            const drStacks = Math.round((1.0 - player.crystalShieldReduction) / 0.05 * 20) / 20;
+            const ringAlpha = 0.25 + drStacks * 0.15;
+            const ringR = 32;
+            const now = Date.now();
+            // Slow rotating dashed ring in crystal cyan
+            ctx.save();
+            ctx.translate(cx, cy);
+            ctx.rotate(now / 4000);
+            ctx.strokeStyle = `hsla(195, 90%, 72%, ${ringAlpha})`;
+            ctx.lineWidth = 1.2;
+            ctx.shadowColor = 'hsl(195, 100%, 80%)';
+            ctx.shadowBlur = 5;
+            ctx.setLineDash([4, 6]);
+            ctx.beginPath();
+            ctx.arc(0, 0, ringR, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.shadowBlur = 0;
+            ctx.restore();
         }
 
         // ── Damage boost: glowing red wing tips ──
@@ -2248,7 +2274,7 @@
         ctx.fillText(`POWERUP IN  ${pUntil} pellet${pUntil !== 1 ? 's' : ''}`, canvas.width - 10, 20);
 
         // ── Powerup bars (bottom of HUD area, above game) ──
-        if (player.powerups.length > 0) {
+        if (player.powerups.length > 0 || player.crystalShieldReduction < 1.0) {
             ctx.fillStyle = 'rgba(0,0,0,0.55)';
             ctx.fillRect(0, 32, canvas.width, 22);
 
@@ -2257,16 +2283,13 @@
                 const pct = p.timer / POWERUP_DURATION;
                 const barW = 110;
 
-                // Bar background
                 ctx.fillStyle = 'rgba(255,255,255,0.1)';
                 ctx.fillRect(barX, 36, barW, 10);
 
-                // Bar fill — color by urgency
                 const barColor = pct > 0.5 ? '#00ff88' : pct > 0.25 ? '#ffaa00' : '#ff3333';
                 ctx.fillStyle = barColor;
                 ctx.fillRect(barX, 36, barW * pct, 10);
 
-                // Label
                 ctx.fillStyle = '#fff';
                 ctx.font = '9px Courier New';
                 ctx.textAlign = 'left';
@@ -2275,6 +2298,19 @@
 
                 barX += barW + 12;
             });
+
+            // Crystal DR badge — permanent, shown right of other powerups
+            if (player.crystalShieldReduction < 1.0) {
+                const pct = Math.round((1 - player.crystalShieldReduction) * 100);
+                ctx.fillStyle = 'rgba(0,0,0,0)'; // transparent bg — badge only
+                ctx.font = 'bold 9px Courier New';
+                ctx.textAlign = 'left';
+                ctx.shadowColor = 'hsl(195,100%,75%)';
+                ctx.shadowBlur = 6;
+                ctx.fillStyle = 'hsl(195,90%,72%)';
+                ctx.fillText(`❋ CRYSTAL WARD  -${pct}% DMG`, barX, 34);
+                ctx.shadowBlur = 0;
+            }
         }
 
         ctx.restore();
@@ -2501,6 +2537,7 @@
                 enemiesDestroyed++;
                 player.score += 150;
                 scoreFlashTimer = 50;
+                player.crystalShieldReduction = Math.max(0.70, player.crystalShieldReduction * 0.95);
                 createCrystalDeathSound();
                 spawnKillStar(obj);
                 WC.registerKill(true);
@@ -2746,7 +2783,7 @@
                 const dmg = hasPowerup('shield')
                     ? (Math.random() > 0.4 ? comet.damage : 0)
                     : comet.damage;
-                if (dmg > 0) { player.health -= dmg; createHitSound(); }
+                if (dmg > 0) { player.health -= Math.round(dmg * player.crystalShieldReduction); createHitSound(); }
                 continue;
             }
         }
@@ -2897,7 +2934,7 @@
                     const dist = Math.sqrt(dx * dx + dy * dy);
                     if (dist < bomb.blastRadius) {
                         const falloff = 1 - dist / bomb.blastRadius;
-                        let dmg = Math.round(bomb.damage * falloff);
+                        let dmg = Math.round(bomb.damage * falloff * player.crystalShieldReduction);
                         if (spectrumImmersed) {
                             // Invincible — no damage
                         } else if (hasPowerup('shield')) {
@@ -3086,6 +3123,8 @@
                             enemiesDestroyed++;
                             player.score += 150;
                             scoreFlashTimer = 50;
+                            // Permanent 5% DR — stacks multiplicatively on repeat kills
+                            player.crystalShieldReduction = Math.max(0.70, player.crystalShieldReduction * 0.95);
                             createCrystalDeathSound();
                             spawnKillStar(crys);
                             WC.registerKill(true);
@@ -3125,16 +3164,15 @@
 
             } else if (bullet.owner === 'enemy' && checkCollision(bullet, player)) {
                 if (spectrumImmersed) {
-                    // Deflect — bullet removed but no damage
                     bulletsToRemove.add(i);
                 } else if (hasPowerup('shield')) {
                     const shieldLevel = getPowerupLevel('shield');
                     if (Math.random() > 0.3 * shieldLevel) {
-                        player.health -= 10;
+                        player.health -= Math.round(10 * player.crystalShieldReduction);
                         createHitSound();
                     }
                 } else {
-                    player.health -= 10;
+                    player.health -= Math.round(10 * player.crystalShieldReduction);
                     createHitSound();
                 }
                 bulletsToRemove.add(i);
@@ -3210,6 +3248,7 @@
         player.x = 100; player.y = canvas.height / 2;
         player.health = 100; player.score = 0;
         player.powerups = []; player.lastPowerupScore = 0;
+        player.crystalShieldReduction = 1.0;
         enemies.length = 0; bullets.length = 0; pellets.length = 0;
         bombs.length = 0; explosions.length = 0; laserBeams.length = 0;
         crystals.length = 0; comets.length = 0;
