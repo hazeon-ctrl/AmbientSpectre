@@ -314,7 +314,7 @@
         const PEAK_ENEMIES  = 5;   // max enemies at triangle peak
         const BASE_ENEMIES  = 1;   // min enemies at triangle trough
         const BETWEEN_FRAMES = 120; // pause between waves (~2s)
-        const CRYSTAL_EVERY  = 3;  // spawn crystal after every Nth wave cleared
+        const CRYSTAL_EVERY  = 1;  // spawn crystal after every Nth wave cleared (1 = every wave)
 
         const pub = {
             wave:         1,
@@ -1038,23 +1038,25 @@
         const y = Math.max(60, Math.min(canvas.height - DANGER_ZONE_HEIGHT - 60,
                     60 + Math.random() * (canvas.height - DANGER_ZONE_HEIGHT - 120)));
 
-        // Health scales with wave — enough to require sustained focus
-        // Wave 3 → 300hp, wave 6 → 380hp, wave 9+ → 460hp
-        const waveBonus = Math.min(6, Math.floor(WC.wave / 3)) * 80;
-        const maxHp     = 300 + waveBonus;
+        // Health scales with wave — a meaty mini-boss that requires sustained focus
+        // Wave 3 → 1120hp, wave 6 → 1240hp, wave 9+ → 1360hp
+        const waveBonus = Math.min(6, Math.floor(WC.wave / 3)) * 120;
+        const maxHp     = 1000 + waveBonus;
 
         crystals.push({
             x, y,
-            health:         maxHp,
-            maxHealth:      maxHp,
-            absorbedMass:   0,
-            size:           28,           // slightly larger base so it reads clearly
-            rotation:       0,
-            cometTimer:     180,          // first comet after 3s so player feels the threat
-            cometInterval:  220,
-            isAlive:        true,
-            hitFlash:       0,
-            hue:            185 + Math.random() * 30,
+            health:          maxHp,
+            maxHealth:       maxHp,
+            absorbedMass:    0,
+            size:            28,
+            rotation:        0,
+            cometTimer:      180,
+            cometInterval:   220,
+            isAlive:         true,
+            hitFlash:        0,
+            hue:             185 + Math.random() * 30,
+            laserDamageTimer: 0,   // contact accumulator; damage ticks every LASER_DMG_INTERVAL frames on a beam
+            laserWidthMul:   1,    // beams slowly widen over the crystal's lifetime (visual + hitbox)
         });
         createCrystalSpawnSound();
     }
@@ -1282,52 +1284,137 @@
     }
 
     // ─── Draw ─────────────────────────────────────────────────────────────────
+    let zoneWashBuffer = null; // offscreen canvas for the Spectrum zone wash (soft edges)
     function drawSpectrum() {
         analyser.getByteFrequencyData(dataArray);
         const barWidth = (canvas.width / bufferLength) * 2.5;
         const isDangerMode = !hasPowerup('spectrum_heal');
+        const isHealing    = spectrumImmersed;  // player in zone WITH heal powerup
+        const now = Date.now();
 
-        // HD-driven hue range — spectrum colour reflects harmonic mode
-        const [hueA, hueB] = HD.getHueRange();
-        // Low-health phrygian pulses the spectrum intensity
-        const phrygianPulse = HD.mode === 'phrygian'
-            ? 0.8 + 0.2 * Math.sin(Date.now() / 120) : 1.0;
+        // ── Zone identity is fixed by STATE, never by the harmonic/combo mode ──
+        //   DANGER → reddish,  HEAL → aqua / light-blue,  READY (heal powerup but
+        //   not yet immersed) → a dim aqua-teal hint. Each is rendered as a vertical
+        //   gradient so the band is never a flat solid tone, and its top + side
+        //   edges fade into translucence so it dissolves softly into the playfield.
+        const zoneTop = canvas.height - DANGER_ZONE_HEIGHT;
 
+        // [topColor, midColor, bottomColor] for the bars and for the zone wash.
+        let barStops, washStops;
+        if (isHealing) {
+            barStops  = ['hsla(192,100%,80%,0.15)', 'hsla(189,100%,62%,0.70)', 'hsla(186,95%,52%,0.95)'];
+            washStops = ['hsla(190,100%,72%,0)',    'hsla(189,100%,58%,0.30)', 'hsla(186,96%,50%,0.55)'];
+        } else if (!isDangerMode) {
+            barStops  = ['hsla(180,85%,72%,0.10)',  'hsla(181,80%,58%,0.50)',  'hsla(183,82%,50%,0.80)'];
+            washStops = ['hsla(182,80%,65%,0)',     'hsla(182,80%,52%,0.14)',  'hsla(182,80%,48%,0.28)'];
+        } else {
+            barStops  = ['hsla(18,100%,66%,0.12)',  'hsla(6,96%,55%,0.60)',    'hsla(356,92%,48%,0.95)'];
+            washStops = ['hsla(8,95%,60%,0)',       'hsla(2,92%,52%,0.22)',    'hsla(356,90%,44%,0.42)'];
+        }
+
+        // ── Zone wash — drawn on an offscreen buffer so the top AND side edges can
+        //    be carved into translucence without disturbing anything already drawn. ──
+        if (!zoneWashBuffer || zoneWashBuffer.width !== canvas.width) {
+            zoneWashBuffer = document.createElement('canvas');
+            zoneWashBuffer.width  = canvas.width;
+            zoneWashBuffer.height = DANGER_ZONE_HEIGHT;
+        }
+        const zc = zoneWashBuffer.getContext('2d');
+        const zw = zoneWashBuffer.width, zh = zoneWashBuffer.height;
+        zc.clearRect(0, 0, zw, zh);
+        // Vertical body gradient: transparent at the top edge → tinted toward the base
+        const bodyGrad = zc.createLinearGradient(0, 0, 0, zh);
+        bodyGrad.addColorStop(0,   washStops[0]);
+        bodyGrad.addColorStop(0.6, washStops[1]);
+        bodyGrad.addColorStop(1,   washStops[2]);
+        zc.globalAlpha = 0.88 + 0.12 * Math.sin(now / 260); // gentle breathing
+        zc.fillStyle = bodyGrad;
+        zc.fillRect(0, 0, zw, zh);
+        zc.globalAlpha = 1;
+        // Carve soft translucent left/right edges
+        zc.globalCompositeOperation = 'destination-out';
+        const edge = Math.min(120, zw * 0.14);
+        const lg = zc.createLinearGradient(0, 0, edge, 0);
+        lg.addColorStop(0, 'rgba(0,0,0,0.95)'); lg.addColorStop(1, 'rgba(0,0,0,0)');
+        zc.fillStyle = lg; zc.fillRect(0, 0, edge, zh);
+        const rg = zc.createLinearGradient(zw, 0, zw - edge, 0);
+        rg.addColorStop(0, 'rgba(0,0,0,0.95)'); rg.addColorStop(1, 'rgba(0,0,0,0)');
+        zc.fillStyle = rg; zc.fillRect(zw - edge, 0, edge, zh);
+        zc.globalCompositeOperation = 'source-over';
+        ctx.drawImage(zoneWashBuffer, 0, zoneTop);
+
+        // ── Spectrum bars — one vertical gradient shared by every bar, anchored
+        //    across the full zone height. Colour identity stays constant and tall
+        //    peaks fade to translucence at their tips. ──
+        const phrygianPulse = HD.mode === 'phrygian' ? 0.8 + 0.2 * Math.sin(now / 120) : 1.0;
+        const barGrad = ctx.createLinearGradient(0, zoneTop, 0, canvas.height);
+        barGrad.addColorStop(0,    barStops[0]);
+        barGrad.addColorStop(0.55, barStops[1]);
+        barGrad.addColorStop(1,    barStops[2]);
+        ctx.fillStyle = barGrad;
         let x = 0;
         for (let i = 0; i < bufferLength; i++) {
             const barHeight = (dataArray[i] / 255) * DANGER_ZONE_HEIGHT * phrygianPulse;
-            // Interpolate hue across the bar range
-            const t = i / bufferLength;
-            const hue = hueA + (hueB - hueA) * t;
-            // Saturation and lightness vary with mode
-            const sat = HD.mode === 'aeolian' ? 70 : HD.mode === 'gmaj' ? 90 : 100;
-            const lit = HD.mode === 'phrygian' ? 45 : 50;
-            ctx.fillStyle = `hsla(${hue}, ${sat}%, ${lit}%, 0.72)`;
             ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
             x += barWidth + 0.5;
         }
 
-        // Zone boundary line — colour reflects HD mode
-        const lineColor = isDangerMode
-            ? (HD.mode === 'phrygian' ? '#cc44ff' :
-               HD.mode === 'aeolian'  ? '#8844ff' : '#ff3333')
-            : '#33ff88';
-        ctx.strokeStyle = lineColor;
-        ctx.lineWidth = 2;
-        ctx.setLineDash([5, 5]);
+        // Zone boundary line — aqua when healing, red for danger, dim aqua when ready
+        if (isHealing) {
+            // Solid, bright, pulsing aqua
+            const linePulse = 0.7 + 0.3 * Math.sin(now / 180);
+            ctx.strokeStyle = `rgba(90, 225, 255, ${linePulse})`;
+            ctx.lineWidth = 2.5;
+            ctx.setLineDash([]);
+            ctx.shadowColor = '#33ccff';
+            ctx.shadowBlur = 10;
+        } else if (!isDangerMode) {
+            // Heal powerup held but not yet immersed — dim aqua, dashed
+            ctx.strokeStyle = 'rgba(90, 210, 255, 0.6)';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([5, 5]);
+            ctx.shadowColor = '#2299cc';
+            ctx.shadowBlur = 4;
+        } else {
+            // Danger — always red, independent of harmonic/combo mode
+            const linePulse = 0.65 + 0.25 * Math.sin(now / 200);
+            ctx.strokeStyle = `rgba(255, 60, 60, ${linePulse})`;
+            ctx.lineWidth = 2;
+            ctx.setLineDash([6, 5]);
+            ctx.shadowColor = '#ff3333';
+            ctx.shadowBlur = 6;
+        }
         ctx.beginPath();
         ctx.moveTo(0, canvas.height - DANGER_ZONE_HEIGHT);
         ctx.lineTo(canvas.width, canvas.height - DANGER_ZONE_HEIGHT);
         ctx.stroke();
         ctx.setLineDash([]);
+        ctx.shadowBlur = 0;
 
-        // Zone label
-        ctx.fillStyle = isDangerMode ? 'rgba(255,51,51,0.5)' : 'rgba(51,255,136,0.4)';
-        ctx.font = '10px Courier New';
+        // Zone label — right side
+        const labelColor = isHealing   ? 'rgba(90,225,255,0.85)'
+                         : isDangerMode ? 'rgba(255,80,80,0.55)'
+                         :                'rgba(90,210,255,0.45)';
+        ctx.fillStyle = labelColor;
+        ctx.font = isHealing ? 'bold 10px Courier New' : '10px Courier New';
         ctx.textAlign = 'right';
         ctx.fillText(isDangerMode ? 'DANGER ZONE' : 'HEAL ZONE', canvas.width - 8, canvas.height - DANGER_ZONE_HEIGHT + 14);
 
-        // ── Harmonic mode label — bottom-left of spectrum strip ──
+        // Mid-screen heal message — only while actively healing, unobtrusive
+        if (isHealing) {
+            const msgAlpha = 0.55 + 0.20 * Math.sin(now / 300);
+            ctx.save();
+            ctx.textAlign = 'center';
+            ctx.font = 'bold 11px Courier New';
+            ctx.fillStyle = `rgba(120, 235, 255, ${msgAlpha})`;
+            ctx.shadowColor = '#33ccff';
+            ctx.shadowBlur = 12;
+            ctx.fillText('♥  SPECTRUM HEALING  ♥', canvas.width / 2, canvas.height - DANGER_ZONE_HEIGHT - 10);
+            ctx.shadowBlur = 0;
+            ctx.restore();
+        }
+
+        // Harmonic mode label — bottom-left
         const modeColors = {
             dorian: 'rgba(100,210,255,0.7)',  dorian_tense: 'rgba(80,255,180,0.75)',
             phrygian: 'rgba(200,80,255,0.8)', aeolian: 'rgba(120,80,255,0.75)',
@@ -1337,7 +1424,7 @@
         ctx.save();
         ctx.font = 'bold 10px Courier New';
         ctx.textAlign = 'left';
-        ctx.fillStyle = modeColors[HD.mode] || 'rgba(180,180,255,0.7)';
+        ctx.fillStyle = isHealing ? 'rgba(120,235,255,0.6)' : (modeColors[HD.mode] || 'rgba(180,180,255,0.7)');
         ctx.shadowColor = ctx.fillStyle;
         ctx.shadowBlur = 6;
         ctx.fillText(`♩ ${HD.modeLabel}`, 8, canvas.height - DANGER_ZONE_HEIGHT + 14);
@@ -2008,6 +2095,55 @@
                 ctx.beginPath();
                 ctx.arc(cx, cy, auraR, 0, Math.PI * 2);
                 ctx.fill();
+
+                // ── Static laser beams — 4 arms at 0°, 90°, 45°, 135° relative to rotation ──
+                // Each arm projects from crystal center to canvas edge in both directions.
+                // Drawn in world space so they truly cross the screen.
+                const laserAngles = [rot, rot + Math.PI / 2, rot + Math.PI / 4, rot + 3 * Math.PI / 4];
+                const canvasDiag  = Math.sqrt(canvas.width * canvas.width + canvas.height * canvas.height);
+                const laserPulse  = 0.45 + 0.30 * Math.sin(now / 280);
+                const laserPulse2 = 0.35 + 0.20 * Math.sin(now / 280 + Math.PI); // opposite phase for variety
+                const wMul        = isFinite(crystal.laserWidthMul) ? crystal.laserWidthMul : 1; // beams widen over time
+
+                laserAngles.forEach((angle, ai) => {
+                    const pulse = ai % 2 === 0 ? laserPulse : laserPulse2;
+                    const ex1 = cx + Math.cos(angle) * canvasDiag;
+                    const ey1 = cy + Math.sin(angle) * canvasDiag;
+                    const ex2 = cx - Math.cos(angle) * canvasDiag;
+                    const ey2 = cy - Math.sin(angle) * canvasDiag;
+
+                    // Wide outer glow
+                    ctx.globalAlpha = pulse * 0.18;
+                    ctx.strokeStyle = `hsl(${hue}, 90%, 75%)`;
+                    ctx.lineWidth   = 14 * wMul;
+                    ctx.shadowColor = `hsl(${hue}, 100%, 80%)`;
+                    ctx.shadowBlur  = 18;
+                    ctx.lineCap     = 'round';
+                    ctx.beginPath();
+                    ctx.moveTo(ex1, ey1); ctx.lineTo(ex2, ey2);
+                    ctx.stroke();
+
+                    // Mid glow
+                    ctx.globalAlpha = pulse * 0.40;
+                    ctx.strokeStyle = `hsl(${hue + 10}, 100%, 85%)`;
+                    ctx.lineWidth   = 5 * wMul;
+                    ctx.shadowBlur  = 8;
+                    ctx.beginPath();
+                    ctx.moveTo(ex1, ey1); ctx.lineTo(ex2, ey2);
+                    ctx.stroke();
+
+                    // Bright core line
+                    ctx.globalAlpha = pulse * 0.85;
+                    ctx.strokeStyle = `hsl(${hue + 20}, 100%, 95%)`;
+                    ctx.lineWidth   = 1.5 * wMul;
+                    ctx.shadowColor = '#ffffff';
+                    ctx.shadowBlur  = 4;
+                    ctx.beginPath();
+                    ctx.moveTo(ex1, ey1); ctx.lineTo(ex2, ey2);
+                    ctx.stroke();
+                });
+                ctx.globalAlpha = 1;
+                ctx.shadowBlur  = 0;
 
                 // Now translate for prism geometry
                 ctx.translate(cx, cy);
@@ -2747,7 +2883,55 @@
                 createCometLaunchSound();
                 crys.cometTimer = 0;
             }
-        }
+
+            // ── Laser beams slowly widen over the crystal's lifetime ──
+            // Drives both the drawn beam width and the damage hitbox below, so the
+            // beams become progressively harder to avoid the longer the boss survives.
+            const LASER_WIDTH_MAX  = 5;      // final width multiplier (5× the spawn width)
+            const LASER_WIDTH_GROW = 0.004;  // per-frame growth (~1→5 over ~17s @60fps)
+            crys.laserWidthMul = Math.min(LASER_WIDTH_MAX,
+                                          (crys.laserWidthMul || 1) + LASER_WIDTH_GROW);
+
+            // ── Laser damage — continuous drain while the player's body overlaps a beam ──
+            // Each beam is an infinite line through the crystal center at rot, rot+90°,
+            // rot+45°, rot+135°. Contact = player center within (beam half-width +
+            // player body radius) perpendicular distance of any beam line, so the ship
+            // takes damage as soon as it visibly touches a beam — not only when perfectly
+            // centered on it. The half-width scales with laserWidthMul so the damage
+            // band always matches the widening visual beam. Damage ticks on a fixed
+            // cadence so lingering on a beam steadily drains health, while a slow
+            // off-contact decay forgives the brief gaps caused by the crystal's rotation.
+            if (!spectrumImmersed) {
+                const laserAngles = [crys.rotation, crys.rotation + Math.PI / 2,
+                                     crys.rotation + Math.PI / 4, crys.rotation + 3 * Math.PI / 4];
+                const BEAM_HALF_WIDTH = 7 * crys.laserWidthMul;              // tracks the drawn beam glow
+                const PLAYER_RADIUS   = Math.min(player.width, player.height) / 2; // ship body (~15px)
+                const hitTol          = BEAM_HALF_WIDTH + PLAYER_RADIUS;     // perpendicular tolerance in px
+                const px2 = pcx - crys.x, py2 = pcy - crys.y;
+                let playerOnLaser = false;
+                for (const angle of laserAngles) {
+                    // Perpendicular distance from player center to infinite line through crystal at angle
+                    const perpDist = Math.abs(px2 * Math.sin(angle) - py2 * Math.cos(angle));
+                    if (perpDist < hitTol) { playerOnLaser = true; break; }
+                }
+
+                const LASER_DMG_INTERVAL = 18; // frames of contact between damage ticks (~3 hits/sec @60fps)
+                if (playerOnLaser) {
+                    crys.laserDamageTimer++;
+                    if (crys.laserDamageTimer >= LASER_DMG_INTERVAL) {
+                        const dmg = Math.max(1, Math.round(5 * player.crystalShieldReduction));
+                        const blocked = hasPowerup('shield') && Math.random() < 0.3 * getPowerupLevel('shield');
+                        if (!blocked) { player.health -= dmg; createHitSound(); }
+                        crys.laserDamageTimer = 0;
+                    }
+                } else {
+                    // Decay slowly: a beam momentarily rotating off the player shouldn't
+                    // wipe accumulated contact, but standing clear stops the drain.
+                    crys.laserDamageTimer = Math.max(0, crys.laserDamageTimer - 1);
+                }
+            }
+
+        }  // end crystal for-loop
 
         // ── Comet update — move, home, tail, collide with player ────────────
         for (let ci = comets.length - 1; ci >= 0; ci--) {
@@ -2831,12 +3015,22 @@
         const ATTRACT_SPEED  = 2.8;
         pellets.forEach(p => {
             p.pulse += 0.1;
+            // Apply autonomous velocity if the pellet has it (crystal death drops)
+            if (p.vx || p.vy) {
+                p.x += p.vx;
+                p.y += p.vy;
+                // Damp toward zero so they coast to rest rather than flying off-screen
+                p.vx *= 0.97;
+                p.vy *= 0.97;
+                // Clamp so they can't leave the play area
+                p.x = Math.max(8, Math.min(canvas.width - 8, p.x));
+                p.y = Math.max(55, Math.min(canvas.height - DANGER_ZONE_HEIGHT - 8, p.y));
+            }
             if (hasActiveCombo) {
                 const dx = pcx - p.x;
                 const dy = pcy - p.y;
                 const dist = Math.sqrt(dx * dx + dy * dy);
                 if (dist < ATTRACT_RADIUS && dist > 1) {
-                    // Stronger pull the closer it gets
                     const strength = ATTRACT_SPEED * (1 - dist / ATTRACT_RADIUS) * 1.6;
                     p.x += (dx / dist) * strength;
                     p.y += (dy / dist) * strength;
@@ -3139,12 +3333,20 @@
                             }
                             explosions.push({ x: crys.x, y: crys.y, blastRadius: 70,
                                 frame: 0, duration: 50, particles });
-                            // Drop pellets
+                            // Drop pellets — aimed toward player so they don't sit idle
+                            const pdx = pcx - crys.x, pdy = pcy - crys.y;
+                            const pdist = Math.sqrt(pdx*pdx + pdy*pdy) || 1;
                             for (let p = 0; p < 3; p++) {
                                 const ang = (p / 3) * Math.PI * 2;
+                                // Bias velocity toward player with spread
+                                const baseAngle = Math.atan2(pdy / pdist, pdx / pdist);
+                                const spread = (Math.random() - 0.5) * 1.2;
+                                const spd = 1.4 + Math.random() * 0.8;
                                 pellets.push({
                                     x: crys.x + Math.cos(ang) * 30,
                                     y: crys.y + Math.sin(ang) * 30,
+                                    vx: Math.cos(baseAngle + spread) * spd,
+                                    vy: Math.sin(baseAngle + spread) * spd,
                                     radius: 8,
                                     color: `hsl(${crys.hue}, 90%, 65%)`,
                                     pulse: Math.random() * Math.PI * 2
