@@ -929,6 +929,24 @@
         return p ? p.level : 0;
     }
 
+    // Pellet attraction — enabled once the player has earned their first powerup
+    // (their first handful of pellets) OR while an AMBIENT combo chain is live.
+    // The AMBIENT combo then scales BOTH the pull radius and the pull rate with the
+    // number of letters revealed (0–7), so a hot kill-streak during a wave peak
+    // sweeps pellets in faster and from farther away — smoothly ramping the pace so
+    // the player can keep up with the wave. Letters = 0 reproduces the old feel.
+    const ATTRACT_BASE_RADIUS = 190;
+    const ATTRACT_BASE_SPEED  = 2.8;
+    const ATTRACT_RADIUS_PER_LETTER = 0.16; // +16% radius per AMBIENT letter (≈2.1× at 7)
+    const ATTRACT_SPEED_PER_LETTER  = 0.15; // +15% rate   per AMBIENT letter (≈2.05× at 7)
+    function getPelletAttraction() {
+        const letters = ambientLettersRevealed; // 0–7 letters of "AMBIENT" currently held
+        const active  = player.powerups.length > 0 || letters > 0;
+        const radius  = ATTRACT_BASE_RADIUS * (1 + letters * ATTRACT_RADIUS_PER_LETTER);
+        const speed   = ATTRACT_BASE_SPEED  * (1 + letters * ATTRACT_SPEED_PER_LETTER);
+        return { active, radius, speed, letters };
+    }
+
     // ─── Shooting ─────────────────────────────────────────────────────────────
     function playerShoot() {
         const hasSpread = hasPowerup('spread_shot');
@@ -1843,10 +1861,9 @@
     }
 
     function drawPellets() {
-        const hasActiveCombo = player.powerups.length > 0;
+        const { active: hasActiveCombo, radius: ATTRACT_RADIUS } = getPelletAttraction();
         const pcx = player.x + player.width / 2;
         const pcy = player.y + player.height / 2;
-        const ATTRACT_RADIUS = 190;
 
         pellets.forEach(pellet => {
             const pulseSize = Math.sin(pellet.pulse) * 3;
@@ -3009,10 +3026,9 @@
             spawnPellet();
             pelletSpawnTimer = 0;
         }
-        // Pellet pulse + combo attraction (pcx/pcy defined above in crystal section)
-        const hasActiveCombo = player.powerups.length > 0;
-        const ATTRACT_RADIUS = 190;
-        const ATTRACT_SPEED  = 2.8;
+        // Pellet pulse + combo attraction (pcx/pcy defined above in crystal section).
+        // Radius and rate scale with the live AMBIENT combo — see getPelletAttraction().
+        const { active: hasActiveCombo, radius: ATTRACT_RADIUS, speed: ATTRACT_SPEED } = getPelletAttraction();
         pellets.forEach(p => {
             p.pulse += 0.1;
             // Apply autonomous velocity if the pellet has it (crystal death drops)
